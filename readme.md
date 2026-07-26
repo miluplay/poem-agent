@@ -10,7 +10,7 @@
 
 ## 数据
 
-- 来源:[chinese-gushiwen](https://github.com/aopao/chinese-gushiwen)(MIT),经筛选与结构化处理。
+- 来源:[chinese-gushiwen](https://github.com/aopao/chinese-gushiwen)(MIT),经筛选与结构化处理。(感谢🙏)
 - 规模:精选 913 首,每首含正文、注释、译文、赏析、标签,赏析单段 ≤ 500 字。
 - 处理:`build_poems.py` 从原始数据筛选并转换为统一的 PoemDetail 契约(见 `data/poems.json`)。
 - 原始数据(`guwen/`)未包含在仓库中,请从上述来源下载后运行 `build_poems.py` 生成。
@@ -29,6 +29,3 @@
 | `search_poems` | 语义检索,返回候选 + 相似度分 |
 | `filter_by_tag` | 按标签/作者/朝代结构化过滤 |
 | `get_poem_detail` | 取单首
-
-# 致谢
-数据来自https://github.com/aopao/chinese-gushiwen
