@@ -22,6 +22,21 @@
 - **Agent 编排层**:手写规划循环(工具调度、终止判断、降级)。
 - **可信度层**:引用绑定 + 置信度判断 + 降级/拒答。
 
+## 首次运行
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# 编辑 .env，填入 DEEPSEEK_API_KEY
+python main.py "赏析《蜀道难》"
+```
+
+不带问题运行 `python main.py` 会进入交互模式；输入 `exit`、`quit` 或
+`退出` 即可结束。默认调用 DeepSeek 的 `deepseek-v4-flash`；可在 `.env`
+中通过 `DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL` 调整。
+
 ## 工具(对模型暴露)
 
 | 工具 | 作用 |
