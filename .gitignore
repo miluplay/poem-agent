@@ -5,3 +5,5 @@ __pycache__/
 .env
 archive/
 task.md
+chroma/
+CXtask.md
