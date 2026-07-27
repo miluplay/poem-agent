@@ -1,15 +1,17 @@
 """手写 agent 循环。第一条纵线:一步 finish 版。
 ★ 这是你要亲手写透的核心,面试会被追问每个环节。"""
+import json
+import os
+import re
+
 from .tools import TOOLS
 from .trust import trustworthiness_check
-from . import store
 from .utils import short_id
-import re
-import json
 
 MAX_STEPS = 4   # 纵线阶段够用;后面 A 线再调大
 
-def run_agent(user_query: str, llm) -> dict:
+def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
+    verbose = verbose or _env_flag_enabled("POEM_AGENT_VERBOSE")
     trajectory = []   # 观察轨迹:每步的 thought/action/observation
 
     for step in range(MAX_STEPS):
@@ -21,24 +23,38 @@ def run_agent(user_query: str, llm) -> dict:
 
         # 3. 解析失败 → 回填错误,让模型自我修正(不崩)
         if decision is None:
-            trajectory.append({"error": "格式非法,请返回 JSON:{thought, action, action_input}"})
+            error = "格式非法,请返回 JSON:{thought, action, action_input}"
+            trajectory.append({"error": error})
+            if verbose:
+                _print_step_error(step + 1, error)
             continue
+
+        if verbose:
+            _print_step_decision(step + 1, decision)
 
         # 4. 终止:模型认为够了 → 进可信度层
         if decision["action"] == "finish":
+            if verbose:
+                _print_final_separator()
             return trustworthiness_check(decision["action_input"]["answer"], trajectory)
 
         # 5. 校验工具
         tool = TOOLS.get(decision["action"])
         if tool is None:
-            trajectory.append({"error": f"未知工具 {decision['action']}"})
+            error = f"未知工具 {decision['action']}"
+            trajectory.append({"error": error})
+            if verbose:
+                _print_observation(f"错误：{error}")
             continue
 
         # 6. 执行工具,观察回填轨迹
         try:
             observation = tool(**decision["action_input"])
         except (TypeError, ValueError) as exc:
-            trajectory.append({"error": f"工具参数错误: {exc}"})
+            error = f"工具参数错误: {exc}"
+            trajectory.append({"error": error})
+            if verbose:
+                _print_observation(f"错误：{error}")
             continue
         trajectory.append({
             "thought": decision.get("thought", ""),
@@ -46,9 +62,48 @@ def run_agent(user_query: str, llm) -> dict:
             "input": decision["action_input"],
             "observation": observation,
         })
+        if verbose:
+            _print_observation(_summarize_observation(observation, concise=True))
 
     # 7. 步数耗尽兜底:基于已有轨迹收尾(先简单返回,后面接 force_finish)
+    if verbose:
+        _print_final_separator()
     return trustworthiness_check("(达到最大步数)", trajectory)
+
+
+def _env_flag_enabled(name: str) -> bool:
+    """识别常见的环境变量布尔值。"""
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _format_action(action: str, action_input: dict) -> str:
+    if action == "finish" and "answer" in action_input:
+        action_input = {**action_input, "answer": "（见最终作答）"}
+    args = ", ".join(
+        f"{key}={json.dumps(value, ensure_ascii=False)}"
+        for key, value in action_input.items()
+    )
+    return f"{action}({args})"
+
+
+def _print_step_decision(step: int, decision: dict) -> None:
+    thought = decision.get("thought") or "（无）"
+    print(f"\n[步骤 {step}] 💭 {thought}")
+    print(f"          🔧 {_format_action(decision['action'], decision['action_input'])}")
+
+
+def _print_step_error(step: int, error: str) -> None:
+    print(f"\n[步骤 {step}] 💭 （模型返回格式非法）")
+    _print_observation(f"错误：{error}")
+
+
+def _print_observation(summary: str) -> None:
+    print(f"          👀 {summary}")
+
+
+def _print_final_separator() -> None:
+    print("\n───────── 最终作答 ─────────")
+
 
 # prompt
 SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能依据【工具返回的资料】作答,严禁凭记忆或常识补充任何原文、注释、译文或赏析内容。
@@ -62,9 +117,15 @@ SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能�
 }
 
 ## 可用工具
+- search_poems(query: str, top_k: int = 5):按用户意图检索诗词,返回候选列表,
+  包含 poem_id、标题、作者、朝代、相似度和匹配方式。适用于用户提到某首诗的
+  标题,或描述某类主题、意象、情感、作者的诗。top_k 可省略。
 - get_poem_detail(poem_id: str):取一首诗的正文、注释、译文、赏析。
-  注意:你通常没有 poem_id。当用户提到某首诗的标题时,系统已为你查好并在
-  【已知信息】中提供 poem_id;若【已知信息】中没有,说明该诗不在语料库内。
+
+## 工具调用流程
+回答任何关于具体诗词的问题前,必须先调用 search_poems 检索。拿到候选后,
+选择与用户意图最匹配的一首,再调用 get_poem_detail(poem_id) 取详情后作答。
+若 search_poems 返回空列表,说明作品不在当前语料范围,按无据不答处理。
 
 ## finish 的用法
 当你已获得足够资料回答用户时,输出:
@@ -75,7 +136,7 @@ SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能�
 }
 
 ## 必须遵守
-1. 无据不答:若【已知信息】中没有相关 poem_id,或工具返回 not_found,
+1. 无据不答:若 search_poems 返回空列表,或 get_poem_detail 返回 not_found,
    直接 finish,并在 answer 中说明"该作品不在当前语料范围,无法给出有依据的解读",
    不得编造原文或赏析。
 2. 引用标注:finish 的 answer 中,每一处解读都要标注它依据的 evidence_id
@@ -83,54 +144,34 @@ SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能�
 3. 只依据资料:不要用你自己的知识补充或"纠正"工具返回的内容。
 """
 
-# 小工具：暂时放置，需要归类
-
-# 常见的提问前后缀词语
-_QUERY_NOISE = [
-    "讲了什么", "讲的什么", "写了什么", "说了什么",
-    "是什么意思", "什么意思", "赏析一下", "赏析", "解释一下", "解释",
-    "翻译一下", "翻译", "的意思", "的赏析", "的译文",
-    "帮我", "请", "这首诗", "这首词", "这篇",
-]
-# 抓书名号内容:《...》或〈...〉,非贪婪
-_TITLE_BRACKET = re.compile(r"[《〈]([^》〉]+)[》〉]")
-def _lookup_known_poems(user_query: str)->list[dict]:
-    # 从输入中匹配标题
-
-    candidates: list[str] = []
-    # 带书名号
-    brack_title = _TITLE_BRACKET.findall(user_query)
-    candidates.extend(brack_title)
-
-    # 无书名号，去除噪声词提取
-    if not candidates:
-        cleaned = user_query
-        for noise in _QUERY_NOISE:
-            cleaned = cleaned.replace(noise, "")
-        cleaned = cleaned.strip(" ，。？！、,.?!")
-        if cleaned:
-            candidates.append(cleaned)
-
-    # 查询
-    found: list[dict] = []
-    seen: set[str] = set()
-    for title in candidates:
-        poem = store.find_by_title(title)
-        if poem and poem["poem_id"] not in seen:
-            found.append(poem)
-            seen.add(poem["poem_id"])
-    return found
-
-
 # 赏析进行摘要处理
-def _summarize_observation(obs: dict) -> str:
+def _summarize_observation(
+    obs: dict | list[dict], *, concise: bool = False
+) -> str:
     """把工具结果整理成带引用编号、可直接作答的上下文。"""
+    if isinstance(obs, list):
+        if not obs:
+            return "未检索到候选诗词。"
+        candidates = []
+        for index, item in enumerate(obs, start=1):
+            candidates.append(
+                f'{index}.《{item["title"]}》{item["author"]} '
+                f'(poem_id={item["poem_id"]}, score={item["score"]:.2f})'
+            )
+        return f"检索到 {len(obs)} 首候选:" + " ".join(candidates)
+
     # 错误情况:如 not_found,直接把错误透传给模型(触发无据不答)
     if "error" in obs:
         return f'错误:{obs["error"]}(poem_id={obs.get("poem_id", "?")})'
 
     appr = obs.get("appreciation", [])
     anno = obs.get("annotations", [])
+
+    if concise:
+        return (
+            f'取到《{obs["title"]}》({obs["dynasty"]}·{obs["author"]})，'
+            f"赏析 {len(appr)} 块，注释 {len(anno)} 条。"
+        )
 
     lines = [
         f'取到《{obs["title"]}》({obs["dynasty"]}·{obs["author"]})。',
@@ -155,17 +196,8 @@ def _summarize_observation(obs: dict) -> str:
 
 
 def build_prompt(user_query: str, trajectory: list) -> str:
-    """系统指令 + 已知信息(预查的 poem_id) + 观察轨迹 + 用户问题。"""
+    """系统指令 + 观察轨迹 + 用户问题。"""
     parts = [SYSTEM_INSTRUCTION]
-
-    # 已知信息:纵线阶段,先用 title 预查 poem_id 塞进来
-    known = _lookup_known_poems(user_query)
-    if known:
-        parts.append("\n## 已知信息")
-        for p in known:
-            parts.append(f'- 标题《{p["title"]}》(作者:{p["author"]}) → poem_id: {p["poem_id"]}')
-    else:
-        parts.append("\n## 已知信息\n(未在语料库中找到用户提到的诗)")
 
     # 观察轨迹:把之前每步的 action + observation 回填,让模型看到进展
     if trajectory:

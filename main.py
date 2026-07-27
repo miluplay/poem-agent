@@ -116,11 +116,13 @@ def print_result(result: dict, *, as_json: bool = False) -> None:
             print(f"- [{evidence_id}] 《{title}》：{item.get('text', '')}")
 
 
-def ask(query: str, llm: DeepSeekLLM, *, as_json: bool) -> None:
+def ask(
+    query: str, llm: DeepSeekLLM, *, as_json: bool, verbose: bool = False
+) -> None:
     query = query.strip()
     if not query:
         return
-    result = run_agent(query, llm)
+    result = run_agent(query, llm, verbose=verbose)
     print_result(result, as_json=as_json)
 
 
@@ -132,6 +134,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key", help=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=float, default=60, help="请求超时秒数")
     parser.add_argument("--json", action="store_true", help="输出完整 JSON")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="显示 Agent 每一步的思考、工具调用和观察摘要",
+    )
     return parser.parse_args()
 
 
@@ -141,7 +149,7 @@ def main() -> int:
     try:
         llm = build_llm(args)
         if args.query:
-            ask(" ".join(args.query), llm, as_json=args.json)
+            ask(" ".join(args.query), llm, as_json=args.json, verbose=args.verbose)
             return 0
 
         print("poem-agent 已启动。输入问题开始，输入 exit / quit / 退出 结束。")
@@ -155,7 +163,7 @@ def main() -> int:
                 print("再见。")
                 return 0
             try:
-                ask(query, llm, as_json=args.json)
+                ask(query, llm, as_json=args.json, verbose=args.verbose)
             except LLMError as exc:
                 print(f"\n错误：{exc}", file=sys.stderr)
     except LLMError as exc:

@@ -49,6 +49,10 @@ python main.py "赏析《蜀道难》"
 
 不带问题运行 `python main.py` 会进入交互模式;输入 `exit`、`quit` 或 `退出` 即可结束。默认调用 DeepSeek 的 `deepseek-v4-flash`;可在 `.env` 中通过 `DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL` 调整。Agent 架构与具体 LLM 解耦,任何 OpenAI 兼容接口均可接入。
 
+调试或演示 Agent 轨迹时，可加 `-v` / `--verbose`，也可设置环境变量
+`POEM_AGENT_VERBOSE=1`。默认关闭，开启后会逐步显示 thought、工具调用参数和
+观测摘要，最终答案与引用依据的输出格式保持不变。
+
 ## 工具
 
 对模型暴露的工具:
