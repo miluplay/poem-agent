@@ -58,14 +58,21 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
         if decision["action"] == "finish":
             if verbose:
                 _print_final_separator()
+            regenerate = lambda feedback="": _extract_finish_answer(
+                llm.generate(_append_regeneration_feedback(prompt, feedback))
+            )
             answer, degraded = answer_integrity_gate(
                 decision["action_input"].get("answer", ""),
-                lambda: _extract_finish_answer(llm.generate(prompt)),
+                regenerate,
                 trajectory,
                 verbose=verbose,
             )
             result = trustworthiness_check(
-                answer, trajectory, session_poems, verbose=verbose
+                answer,
+                trajectory,
+                session_poems,
+                regenerate=regenerate,
+                verbose=verbose,
             )
             if degraded:
                 result["degraded"] = True
@@ -204,14 +211,21 @@ def force_finish(
 
     raw_answer = llm.generate(prompt)
     answer = _extract_force_finish_answer(raw_answer)
+    regenerate = lambda feedback="": _extract_force_finish_answer(
+        llm.generate(_append_regeneration_feedback(prompt, feedback))
+    )
     answer, degraded = answer_integrity_gate(
         answer,
-        lambda: _extract_force_finish_answer(llm.generate(prompt)),
+        regenerate,
         trajectory,
         verbose=verbose,
     )
     result = trustworthiness_check(
-        answer, trajectory, session_poems, verbose=verbose
+        answer,
+        trajectory,
+        session_poems,
+        regenerate=regenerate,
+        verbose=verbose,
     )
     if degraded:
         result["degraded"] = True
@@ -262,6 +276,17 @@ def _extract_finish_answer(raw: str) -> str:
         return ""
     answer = decision["action_input"].get("answer")
     return answer if isinstance(answer, str) else ""
+
+
+def _append_regeneration_feedback(prompt: str, feedback: str) -> str:
+    """有修正反馈时追加到原 prompt；完整性重试则保持原 prompt 不变。"""
+    if not feedback:
+        return prompt
+    return (
+        f"{prompt}\n\n## 上一次答案的引用修正反馈\n{feedback}\n"
+        "请立刻按反馈重新作答。正常 finish 流程仍只输出 action=finish 的"
+        " JSON；步数耗尽流程仍只输出最终回答正文。"
+    )
 
 
 def _assign_session_poem(
@@ -364,13 +389,30 @@ get_poem_detail(poem_id) 取详情后作答。
 1. 无据不答:若 search_poems 返回空列表,或 get_poem_detail 返回 not_found,
    直接 finish,并在 answer 中说明"该作品不在当前语料范围,无法给出有依据的解读",
    不得编造原文或赏析。
-2. 引用标注:finish 的 answer 中,每一处解读都要标注它依据的 evidence_id
-   (如 [诗1-appr-0]、[诗1-note-2]),编号必须使用详情观察中展示的
-   appreciation/annotations 块引用。引用标记仅用于引用赏析或注释中的
-   具体解读内容。作者、朝代、标题、某诗是否为某人所作等事实性元信息,
-   直接陈述即可,不要附加任何引用标记。
-   严禁自造引用格式:不得输出 [诗N-title]、[诗N](无段类型/段号)等
-   不在 [诗N-appr-x] / [诗N-note-x] 合法格式内的标记。
+2. 引用规则按内容性质分三类:
+
+   【不需要引用,直接陈述】
+   - 元信息:作者、朝代、标题、体裁(如五言绝句、词牌名)。
+   - 诗歌正文原句:直接引用诗句本身(如“床前明月光”)时,不需要挂
+     赏析/注释编号。
+   - 行文结构与连接句:如“下面分析其手法”“综上”“两首诗对比来看”等
+     承接、总起的骨架句。
+
+   【必须引用,可引多个、可复用】
+   - 任何具体解读主张:意象含义、字词之妙、情感基调、艺术手法、
+     历史背景解读、诗人意图等,凡依赖赏析或注释原文才成立的判断,
+     必须标注来源。
+   - 一处主张可同时引用多个编号(如
+     [诗1-appr-0][诗1-appr-3]),多处主张也可复用同一编号。
+   - 若某句解读在赏析/注释中找不到任何真实支撑,就不要写这句话,
+     宁可少说；严禁为凑格式标注不存在或不相关的编号。
+
+   【绝对禁止】
+   - 编造赏析/注释中不存在的解读,无论是否标注编号。
+   - 标注不存在的编号(如诗只有 5 块赏析却写 [诗1-appr-9],
+     或引用未取详情的诗号)。
+   - 自造引用格式:不得输出 [诗N-title]、[诗N](无段类型/段号)等
+     不在 [诗N-appr-x] / [诗N-note-x] 合法格式内的标记。
 3. 只依据资料:不要用你自己的知识补充或"纠正"工具返回的内容。
 """
 

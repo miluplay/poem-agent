@@ -11,6 +11,10 @@ _LEGAL_CITE = re.compile(r"\[诗\d+-(?:appr|note)-\d+\]")
 _CITE_LIKE = re.compile(r"\[诗\d+[^\]]*\]")
 _SESSION_CITE = re.compile(r"\[诗(\d+)-((?:appr|note)-\d+)\]")
 _MIN_ANSWER_LENGTH = 10
+_DANGLING_DEGRADED_REASON = "存在无法匹配出处的引用"
+_DANGLING_DEGRADED_NOTICE = (
+    "（部分解读未能匹配到可靠出处，已尽力修正，请谨慎参考）"
+)
 
 
 def is_answer_suspiciously_incomplete(answer: str) -> bool:
@@ -75,24 +79,89 @@ def trustworthiness_check(
     answer: str,
     trajectory: list,
     session_poems: dict[int, str] | None = None,
+    regenerate: Callable[[str], str] | None = None,
     *,
     verbose: bool = False,
 ) -> dict:
     """finish 后必经此处。
-    纵线阶段:把 answer 里引用到的证据块,从轨迹里捞出来附上(引用绑定)。
-    后续增量:在这里加 no_hit / low_conf / 前提纠正 三种降级分支。"""
+    先剥离非法 marker 并绑定引用；悬空时携带具体反馈重生成一次，
+    重试仍失败才诚实降级。"""
     session_poems = session_poems or {}
     answer = _strip_invalid_citation_markers(answer)
     evidence = collect_evidence(answer, trajectory, session_poems)
+    dangling_citations = list_dangling_citations(evidence)
+    degraded = False
+    regeneration_attempted = False
+
+    if dangling_citations and regenerate is not None:
+        regeneration_attempted = True
+        if verbose:
+            print(
+                "          [悬空引用检查] 检测到悬空引用，"
+                "携带具体出处反馈重试"
+            )
+        answer = _strip_invalid_citation_markers(
+            regenerate(_dangling_regeneration_feedback(dangling_citations))
+        )
+        evidence = collect_evidence(answer, trajectory, session_poems)
+        dangling_citations = list_dangling_citations(evidence)
+        if verbose and not dangling_citations:
+            print("          [悬空引用检查] 重试后已消除悬空引用")
+
+    if dangling_citations:
+        degraded = True
+        answer = _append_degraded_notice(answer)
+        if verbose:
+            state = "重试后仍有" if regeneration_attempted else "存在"
+            print(f"          [悬空引用检查] {state}悬空引用，降级")
+
     confidence = compute_confidence(trajectory, session_poems)
+    if degraded:
+        confidence["degraded_reason"] = _DANGLING_DEGRADED_REASON
     if verbose:
         _print_confidence(confidence)
     return {
         "answer": answer,
         "evidence": evidence,   # [{evidence_id, text, poem_id, title}]
         "confidence": confidence,
-        "degraded": False,      # 增量 3 起,降级时置 True 并带原因
+        "degraded": degraded,
     }
+
+
+def list_dangling_citations(evidence: list) -> list[str]:
+    """返回按答案引用顺序排列的“诗号-段号 + 原因”简明清单。"""
+    dangling: list[str] = []
+    for item in evidence:
+        if not isinstance(item, dict) or item.get("dangling") is not True:
+            continue
+        citation = item.get("citation") or item.get("evidence_id") or "未知引用"
+        reason = item.get("reason") or "无法匹配出处"
+        dangling.append(f"[{citation}]：{reason}")
+    return dangling
+
+
+def _dangling_regeneration_feedback(dangling_citations: list[str]) -> str:
+    """把悬空清单转成一次性重生成所需的明确修正反馈。"""
+    details = "\n".join(
+        f"- 第 {index} 处引用 {citation}，指向不存在的出处。"
+        for index, citation in enumerate(dangling_citations, start=1)
+    )
+    return (
+        "你的回答存在悬空引用：\n"
+        f"{details}\n"
+        "请勿编造引用。请重新生成完整答案，只使用【已执行的步骤】中"
+        "详情观察里真实存在的赏析/注释编号；若某处解读没有真实支撑，"
+        "请删去该处解读。"
+    )
+
+
+def _append_degraded_notice(answer: str) -> str:
+    """保留悬空正文和 marker，仅在尾部追加一次诚实提示。"""
+    stripped = answer.rstrip()
+    if stripped.endswith(_DANGLING_DEGRADED_NOTICE):
+        return stripped
+    separator = "\n" if stripped else ""
+    return f"{stripped}{separator}{_DANGLING_DEGRADED_NOTICE}"
 
 
 def _strip_invalid_citation_markers(answer: str) -> str:
