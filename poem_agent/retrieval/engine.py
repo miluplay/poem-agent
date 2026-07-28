@@ -1,4 +1,4 @@
-"""供 agent 调用的工具函数。"""
+"""混合检索算法实现。"""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from . import store
+from .. import store
 
 
-_ROOT = Path(__file__).resolve().parent.parent
+_ROOT = Path(__file__).resolve().parents[2]
 _CHROMA_PATH = _ROOT / "chroma"
 _MODEL_NAME = "BAAI/bge-large-zh-v1.5"
 _QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
@@ -217,14 +217,8 @@ def _title_shortcut_result(poem: dict) -> list[dict]:
     ]
 
 
-def search_poems(query: str, top_k: int = 5) -> list[dict]:
-    """混合检索诗文，融合标题、正文/赏析语义和标签信号。"""
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("query 必须是非空字符串")
-    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
-        raise ValueError("top_k 必须是正整数")
-
-    query = query.strip()
+def hybrid_search(query: str, top_k: int) -> list[dict]:
+    """融合标题、正文/赏析语义和标签信号检索诗文。"""
     exact_title_matches, partial_title_matches = _title_matches(query)
     if len(exact_title_matches) == 1:
         return _title_shortcut_result(exact_title_matches[0])
@@ -296,44 +290,3 @@ def search_poems(query: str, top_k: int = 5) -> list[dict]:
     for item in candidates:
         del item["_title_match_rank"]
     return candidates[:top_k]
-
-
-def get_poem_detail(poem_id: str) -> dict:
-    """取单首的正文/注释/译文/赏析。
-    返回结构(契约,不要改):
-    {
-        "poem_id": str, "title": str, "author": str, "dynasty": str,
-        "content": str,
-        "appreciation": [{"evidence_id": str, "text": str}, ...],
-        "annotations": [{"evidence_id": str, "text": str}, ...],
-        "source_url": str | None,   # 本地数据用 source 字段代替
-    }
-    找不到时返回 {"error": "not_found", "poem_id": poem_id}。"""
-    poem = store.get_by_id(poem_id)
-    if poem is None:
-        return {"error": "not_found", "poem_id": poem_id}
-
-    # 只暴露工具契约中的字段，并复制证据块，避免调用方改写缓存数据。
-    return {
-        "poem_id": poem["poem_id"],
-        "title": poem["title"],
-        "author": poem["author"],
-        "dynasty": poem["dynasty"],
-        "content": poem["content"],
-        "appreciation": [
-            {"evidence_id": item["evidence_id"], "text": item["text"]}
-            for item in poem.get("appreciation", [])
-        ],
-        "annotations": [
-            {"evidence_id": item["evidence_id"], "text": item["text"]}
-            for item in poem.get("annotations", [])
-        ],
-        "source_url": poem.get("source_url") or poem.get("source"),
-    }
-
-
-# 工具注册表:循环靠它查名字、调用
-TOOLS = {
-    "search_poems": search_poems,
-    "get_poem_detail": get_poem_detail,
-}

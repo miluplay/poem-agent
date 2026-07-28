@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_PATH = ROOT / "data" / "poems.json"
 DEFAULT_CHROMA_PATH = ROOT / "chroma"
 DEFAULT_MODEL = "BAAI/bge-large-zh-v1.5"
