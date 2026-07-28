@@ -229,7 +229,8 @@ def build_force_finish_prompt(
         + "\n\n## 步数耗尽后的最终要求\n"
         "已达到步数上限。请基于【已检索到的信息】给出你目前能给出的最佳回答,"
         "诚实说明这是基于现有信息的初步回答,并具体提示用户可以如何追问以获得"
-        "更完整的结果。仍需遵守:每处解读标注 [诗N-xxx] 引用,不得编造。"
+        "更完整的结果。仍需遵守:每处解读只能标注 [诗N-appr-x] 或"
+        " [诗N-note-x] 引用,不得编造。"
         "如果轨迹里没有任何有效检索结果,请诚实说明没有找到。"
         "这一次不要再选择工具,也不要输出 JSON,只输出最终回答正文。"
     )
@@ -364,8 +365,12 @@ get_poem_detail(poem_id) 取详情后作答。
    直接 finish,并在 answer 中说明"该作品不在当前语料范围,无法给出有依据的解读",
    不得编造原文或赏析。
 2. 引用标注:finish 的 answer 中,每一处解读都要标注它依据的 evidence_id
-   (如 [诗1-appr-0]、[诗1-anno-2]),编号必须原样使用详情观察中展示的
-   appreciation/annotations 块引用。
+   (如 [诗1-appr-0]、[诗1-note-2]),编号必须使用详情观察中展示的
+   appreciation/annotations 块引用。引用标记仅用于引用赏析或注释中的
+   具体解读内容。作者、朝代、标题、某诗是否为某人所作等事实性元信息,
+   直接陈述即可,不要附加任何引用标记。
+   严禁自造引用格式:不得输出 [诗N-title]、[诗N](无段类型/段号)等
+   不在 [诗N-appr-x] / [诗N-note-x] 合法格式内的标记。
 3. 只依据资料:不要用你自己的知识补充或"纠正"工具返回的内容。
 """
 
@@ -430,6 +435,8 @@ def _summarize_observation(
         lines.append(f"注释共 {len(anno)} 条:")
         for item in anno:
             short = short_id(item["evidence_id"])
+            if short.startswith("anno-"):
+                short = "note-" + short.removeprefix("anno-")
             cite = (
                 f"诗{poem_number}-{short}"
                 if poem_number is not None

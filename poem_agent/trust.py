@@ -6,8 +6,10 @@ from collections.abc import Callable
 CONF_NORMAL = 0.6
 CONF_LOWCONF = 0.35
 
-# 抽出会话诗序号和诗内短 id，如 [诗1-appr-0]、[诗2-anno-12]。
-_SESSION_CITE = re.compile(r"\[诗(\d+)-((?:appr|anno)-[\w-]+)\]")
+# 对外只允许赏析和注释两类引用；宽匹配用于剥离模型自造的类似引用。
+_LEGAL_CITE = re.compile(r"\[诗\d+-(?:appr|note)-\d+\]")
+_CITE_LIKE = re.compile(r"\[诗\d+[^\]]*\]")
+_SESSION_CITE = re.compile(r"\[诗(\d+)-((?:appr|note)-\d+)\]")
 _MIN_ANSWER_LENGTH = 10
 
 
@@ -80,6 +82,7 @@ def trustworthiness_check(
     纵线阶段:把 answer 里引用到的证据块,从轨迹里捞出来附上(引用绑定)。
     后续增量:在这里加 no_hit / low_conf / 前提纠正 三种降级分支。"""
     session_poems = session_poems or {}
+    answer = _strip_invalid_citation_markers(answer)
     evidence = collect_evidence(answer, trajectory, session_poems)
     confidence = compute_confidence(trajectory, session_poems)
     if verbose:
@@ -90,6 +93,28 @@ def trustworthiness_check(
         "confidence": confidence,
         "degraded": False,      # 增量 3 起,降级时置 True 并带原因
     }
+
+
+def _strip_invalid_citation_markers(answer: str) -> str:
+    """静默剥离正文中形似引用但不符合合法格式的 marker。"""
+    cleaned = _CITE_LIKE.sub(
+        lambda match: (
+            match.group(0)
+            if _LEGAL_CITE.fullmatch(match.group(0))
+            else ""
+        ),
+        answer,
+    )
+    # 清理剥离后形成的双空格、中文句中的孤立空格和行尾空格。
+    cleaned = re.sub(r"(?<=\S)[ \t]{2,}(?=\S)", " ", cleaned)
+    cleaned = re.sub(
+        r"(?<=[\u3400-\u9fff，。！？；：、])[ \t]+"
+        r"(?=[\u3400-\u9fff，。！？；：、])",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"[ \t]+(?=[，。！？；：、,.!?;:])", "", cleaned)
+    return re.sub(r"[ \t]+$", "", cleaned, flags=re.MULTILINE)
 
 
 def compute_confidence(
@@ -188,7 +213,7 @@ def collect_evidence(
     session_poems: dict[int, str] | None = None,
 ) -> list:
     """★ 引用绑定核心:
-    1. 从 answer 抽出所有 [诗N-appr-x]/[诗N-anno-x] 引用;
+    1. 从 answer 抽出所有 [诗N-appr-x]/[诗N-note-x] 引用;
     2. 用 N 经 session_poems 找 poem_id;
     3. 用 poem_id + "#" + 诗内短 id 定位完整证据块。
     """
@@ -276,10 +301,14 @@ def _build_evidence_index(trajectory: list) -> dict:
             for item in obs.get(key, []):
                 full_id = item.get("evidence_id")
                 if not full_id: continue
-                index[full_id] = {
+                block = {
                     "evidence_id": full_id,
                     "text": item["text"],
                     "poem_id": poem_id,
                     "title": title,
                 }
+                index[full_id] = block
+                # 语料中的注释 ID 沿用 anno-*，对外合法 marker 使用 note-*。
+                if "#anno-" in full_id:
+                    index[full_id.replace("#anno-", "#note-", 1)] = block
     return index
