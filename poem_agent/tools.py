@@ -16,6 +16,7 @@ _QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 _CONTENT_COLLECTION = "poem_content"
 _APPRECIATION_COLLECTION = "poem_appreciation"
 _SEMANTIC_TOP_N = 20
+_MIN_SUBSTRING_TITLE_LENGTH = 2
 
 
 def _build_vocabularies() -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
@@ -150,7 +151,7 @@ def _is_partial_title_match(
 
 
 def _title_matches(query: str) -> tuple[list[dict], list[dict]]:
-    """按精确、部分两级查找标题命中，复用 store 的归一化规则。"""
+    """查找完整检索使用的精确/部分标题命中，复用标题归一化规则。"""
     normalized_query = store._normalize_title(query)
     exact_matches: list[dict] = []
     partial_matches: list[dict] = []
@@ -168,6 +169,54 @@ def _title_matches(query: str) -> tuple[list[dict], list[dict]]:
     return exact_matches, partial_matches
 
 
+def _is_content_title_match(
+    normalized_title: str, normalized_query: str
+) -> bool:
+    """判断标题能否作为 query 中的内容线索，单字标题一律排除。"""
+    return (
+        len(normalized_title) >= _MIN_SUBSTRING_TITLE_LENGTH
+        and normalized_title != normalized_query
+        and normalized_title in normalized_query
+    )
+
+
+def _content_title_matches(
+    query: str, query_authors: set[str]
+) -> list[dict]:
+    """用 query 中的标题子串定位诗，并用已识别作者核对候选。"""
+    normalized_query = store._normalize_title(query)
+    matches: list[dict] = []
+
+    for poem in store.load_poems():
+        title = poem.get("title")
+        if not isinstance(title, str):
+            continue
+        normalized_title = store._normalize_title(title)
+        if _is_content_title_match(normalized_title, normalized_query):
+            matches.append(poem)
+
+    # 查询提到作者时始终核对，避免唯一标题也因作者不符而误短路。
+    if query_authors:
+        matches = [
+            poem for poem in matches if poem.get("author") in query_authors
+        ]
+    return matches
+
+
+def _title_shortcut_result(poem: dict) -> list[dict]:
+    """构造唯一标题定位时的短路返回值。"""
+    return [
+        {
+            "poem_id": poem["poem_id"],
+            "title": poem["title"],
+            "author": poem["author"],
+            "dynasty": poem["dynasty"],
+            "score": 1.0,
+            "matched_by": "title",
+        }
+    ]
+
+
 def search_poems(query: str, top_k: int = 5) -> list[dict]:
     """混合检索诗文，融合标题、正文/赏析语义和标签信号。"""
     if not isinstance(query, str) or not query.strip():
@@ -178,20 +227,14 @@ def search_poems(query: str, top_k: int = 5) -> list[dict]:
     query = query.strip()
     exact_title_matches, partial_title_matches = _title_matches(query)
     if len(exact_title_matches) == 1:
-        poem = exact_title_matches[0]
-        return [
-            {
-                "poem_id": poem["poem_id"],
-                "title": poem["title"],
-                "author": poem["author"],
-                "dynasty": poem["dynasty"],
-                "score": 1.0,
-                "matched_by": "title",
-            }
-        ]
+        return _title_shortcut_result(exact_title_matches[0])
 
     poems_by_id = {poem["poem_id"]: poem for poem in store.load_poems()}
     query_authors, query_dynasties, query_tags = _extract_query_terms(query)
+    content_title_matches = _content_title_matches(query, query_authors)
+    if len(content_title_matches) == 1:
+        return _title_shortcut_result(content_title_matches[0])
+
     exact_title_ids = {
         poem["poem_id"] for poem in exact_title_matches
     }

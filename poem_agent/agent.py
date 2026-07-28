@@ -5,7 +5,11 @@ import os
 import re
 
 from .tools import TOOLS
-from .trust import answer_integrity_gate, trustworthiness_check
+from .trust import (
+    answer_integrity_gate,
+    compute_confidence,
+    trustworthiness_check,
+)
 from .utils import short_id
 
 MAX_STEPS = 6
@@ -60,7 +64,9 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
                 trajectory,
                 verbose=verbose,
             )
-            result = trustworthiness_check(answer, trajectory, session_poems)
+            result = trustworthiness_check(
+                answer, trajectory, session_poems, verbose=verbose
+            )
             if degraded:
                 result["degraded"] = True
             return result
@@ -204,7 +210,9 @@ def force_finish(
         trajectory,
         verbose=verbose,
     )
-    result = trustworthiness_check(answer, trajectory, session_poems)
+    result = trustworthiness_check(
+        answer, trajectory, session_poems, verbose=verbose
+    )
     if degraded:
         result["degraded"] = True
     return result
@@ -333,6 +341,24 @@ get_poem_detail(poem_id) 取详情后作答。
   "action_input": { "answer": "你的回答,每处解读后标注引用编号,如 [诗1-appr-0]" }
 }
 
+## 按依据强度调整语气
+你会看到每首诗的【依据强度】。作答时,你的语气必须与依据强度匹配:
+- 依据充分(normal)的内容:可以正常、肯定地陈述。
+- 依据较弱(low_conf)的内容:必须用审慎的口吻表达,如"从有限的资料看"、
+  "这首诗主题上较为接近,但可能不是最贴切的"、"依据不够充分,仅供参考",
+  让用户清楚这部分把握有限。
+不要对依据较弱的内容使用笃定语气。low_conf 的内容仍须按要求标注引用,
+让用户可以核对出处。
+
+## 用户前提纠正
+若用户的前提(如作者归属、朝代、诗句出处等)与你检索到的事实矛盾,
+必须先明确指出并纠正,再基于正确的事实作答。
+例如:用户问"李白的《春望》",但检索到《春望》作者是杜甫,应先纠正
+"《春望》作者为杜甫,非李白",再作答。
+仅在确有冲突时纠正;若用户前提正确,不要无中生有地"纠正"。
+纠正所依据的事实必须来自已取得的诗词详情中的标题、作者、朝代等字段,
+不得凭记忆纠正;后续解读仍须遵守引用标注要求。
+
 ## 必须遵守
 1. 无据不答:若 search_poems 返回空列表,或 get_poem_detail 返回 not_found,
    直接 finish,并在 answer 中说明"该作品不在当前语料范围,无法给出有依据的解读",
@@ -429,7 +455,7 @@ def build_prompt(
     trajectory: list,
     session_poems: dict[int, str] | None = None,
 ) -> str:
-    """系统指令 + 观察轨迹 + 用户问题。"""
+    """系统指令 + 观察轨迹 + 分诗采信度 + 用户问题。"""
     parts = [SYSTEM_INSTRUCTION]
     session_poems = session_poems or {}
 
@@ -444,6 +470,27 @@ def build_prompt(
                     step["observation"], session_poems=session_poems
                 )
                 parts.append(f'[{i}] 调用 {step["action"]}({step["input"]}) → {obs}')
+
+    # 将指令 1 计算出的分诗采信度显式注入模型上下文，使正常 finish、
+    # 完整性重试和 force_finish 都能按每首诗的依据强弱调整表达语气。
+    confidence_table = compute_confidence(
+        trajectory, session_poems
+    )["confidence_table"]
+    if confidence_table:
+        parts.append("\n## 各诗依据强度")
+        for poem_number, item in confidence_table.items():
+            title = item.get("title") or "未知标题"
+            level = item["level"]
+            if level == "normal":
+                strength = "依据充分(normal)"
+            elif level == "low_conf":
+                strength = (
+                    "依据较弱(low_conf) — 检索匹配有限,主题上可能接近"
+                    "但不一定最贴切"
+                )
+            else:
+                strength = "依据不足(no_hit) — 一般不应据此作答"
+            parts.append(f"- 诗{poem_number}《{title}》:{strength}")
 
     parts.append(f"\n## 用户问题\n{user_query}")
     parts.append("\n请输出你这一步的 JSON 决策:")
