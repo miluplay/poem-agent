@@ -13,10 +13,11 @@ MAX_STEPS = 4   # 纵线阶段够用;后面 A 线再调大
 def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
     verbose = verbose or _env_flag_enabled("POEM_AGENT_VERBOSE")
     trajectory = []   # 观察轨迹:每步的 thought/action/observation
+    session_poems: dict[int, str] = {}  # 会话诗序号 → poem_id
 
     for step in range(MAX_STEPS):
         # 1. 构建 prompt(系统指令 + 工具描述 + 已有观察)
-        prompt = build_prompt(user_query, trajectory)
+        prompt = build_prompt(user_query, trajectory, session_poems)
 
         # 2. LLM 决策,要求返回结构化 JSON
         decision = parse_decision(llm.generate(prompt))
@@ -36,7 +37,9 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
         if decision["action"] == "finish":
             if verbose:
                 _print_final_separator()
-            return trustworthiness_check(decision["action_input"]["answer"], trajectory)
+            return trustworthiness_check(
+                decision["action_input"]["answer"], trajectory, session_poems
+            )
 
         # 5. 校验工具
         tool = TOOLS.get(decision["action"])
@@ -56,19 +59,43 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
             if verbose:
                 _print_observation(f"错误：{error}")
             continue
-        trajectory.append({
+        if (
+            decision["action"] == "get_poem_detail"
+            and isinstance(observation, dict)
+            and "error" not in observation
+        ):
+            _assign_session_poem(session_poems, observation["poem_id"])
+
+        trajectory_step = {
             "thought": decision.get("thought", ""),
             "action": decision["action"],
             "input": decision["action_input"],
             "observation": observation,
-        })
+        }
+        trajectory.append(trajectory_step)
         if verbose:
-            _print_observation(_summarize_observation(observation, concise=True))
+            _print_observation(
+                _summarize_observation(
+                    observation, session_poems=session_poems, concise=True
+                )
+            )
 
     # 7. 步数耗尽兜底:基于已有轨迹收尾(先简单返回,后面接 force_finish)
     if verbose:
         _print_final_separator()
-    return trustworthiness_check("(达到最大步数)", trajectory)
+    return trustworthiness_check("(达到最大步数)", trajectory, session_poems)
+
+
+def _assign_session_poem(
+    session_poems: dict[int, str], poem_id: str
+) -> int:
+    """为取到详情的诗分配稳定会话序号；同一 poem_id 始终复用原序号。"""
+    for poem_number, known_poem_id in session_poems.items():
+        if known_poem_id == poem_id:
+            return poem_number
+    poem_number = len(session_poems) + 1
+    session_poems[poem_number] = poem_id
+    return poem_number
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -118,13 +145,15 @@ SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能�
 
 ## 可用工具
 - search_poems(query: str, top_k: int = 5):按用户意图检索诗词,返回候选列表,
-  包含 poem_id、标题、作者、朝代、相似度和匹配方式。适用于用户提到某首诗的
-  标题,或描述某类主题、意象、情感、作者的诗。top_k 可省略。
-- get_poem_detail(poem_id: str):取一首诗的正文、注释、译文、赏析。
+  每项包含真实 poem_id、标题、作者和相似度。适用于用户提到某首诗的标题,
+  或描述某类主题、意象、情感、作者的诗。top_k 可省略。
+- get_poem_detail(poem_id: str):按真实 poem_id 取一首诗的正文、注释、译文、
+  赏析。poem_id 必须原样复制自 search_poems 的候选,不要填写标题。
 
 ## 工具调用流程
 回答任何关于具体诗词的问题前,必须先调用 search_poems 检索。拿到候选后,
-选择与用户意图最匹配的一首,再调用 get_poem_detail(poem_id) 取详情后作答。
+选择与用户意图最匹配的一首,从候选中原样复制其 poem_id,再调用
+get_poem_detail(poem_id) 取详情后作答。
 若 search_poems 返回空列表,说明作品不在当前语料范围,按无据不答处理。
 
 ## finish 的用法
@@ -132,7 +161,7 @@ SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能�
 {
   "thought": "...",
   "action": "finish",
-  "action_input": { "answer": "你的回答,每处解读后标注引用编号,如 [appr-0]" }
+  "action_input": { "answer": "你的回答,每处解读后标注引用编号,如 [诗1-appr-0]" }
 }
 
 ## 必须遵守
@@ -140,25 +169,29 @@ SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能�
    直接 finish,并在 answer 中说明"该作品不在当前语料范围,无法给出有依据的解读",
    不得编造原文或赏析。
 2. 引用标注:finish 的 answer 中,每一处解读都要标注它依据的 evidence_id
-   (如 [appr-0]、[anno-2]),编号对应工具返回的 appreciation/annotations 块。
+   (如 [诗1-appr-0]、[诗1-anno-2]),编号必须原样使用详情观察中展示的
+   appreciation/annotations 块引用。
 3. 只依据资料:不要用你自己的知识补充或"纠正"工具返回的内容。
 """
 
 # 赏析进行摘要处理
 def _summarize_observation(
-    obs: dict | list[dict], *, concise: bool = False
+    obs: dict | list[dict],
+    *,
+    session_poems: dict[int, str] | None = None,
+    concise: bool = False,
 ) -> str:
     """把工具结果整理成带引用编号、可直接作答的上下文。"""
     if isinstance(obs, list):
         if not obs:
             return "未检索到候选诗词。"
         candidates = []
-        for index, item in enumerate(obs, start=1):
+        for item in obs:
             candidates.append(
-                f'{index}.《{item["title"]}》{item["author"]} '
+                f'《{item["title"]}》{item["author"]} '
                 f'(poem_id={item["poem_id"]}, score={item["score"]:.2f})'
             )
-        return f"检索到 {len(obs)} 首候选:" + " ".join(candidates)
+        return f"检索到 {len(obs)} 首候选:\n" + "\n".join(candidates)
 
     # 错误情况:如 not_found,直接把错误透传给模型(触发无据不答)
     if "error" in obs:
@@ -166,15 +199,19 @@ def _summarize_observation(
 
     appr = obs.get("appreciation", [])
     anno = obs.get("annotations", [])
+    poem_number = _session_poem_number(session_poems or {}, obs.get("poem_id"))
+    poem_label = f"【诗{poem_number}】" if poem_number is not None else ""
 
     if concise:
         return (
-            f'取到《{obs["title"]}》({obs["dynasty"]}·{obs["author"]})，'
+            f'{poem_label}取到《{obs["title"]}》'
+            f'({obs["dynasty"]}·{obs["author"]})，'
             f"赏析 {len(appr)} 块，注释 {len(anno)} 条。"
         )
 
     lines = [
-        f'取到《{obs["title"]}》({obs["dynasty"]}·{obs["author"]})。',
+        f'{poem_label}取到《{obs["title"]}》'
+        f'({obs["dynasty"]}·{obs["author"]})。',
         f'正文：\n{obs.get("content", "")}',
     ]
 
@@ -182,7 +219,12 @@ def _summarize_observation(
         lines.append(f"赏析共 {len(appr)} 块:")
         for item in appr:
             short = short_id(item["evidence_id"])
-            lines.append(f"[{short}] {item['text']}")
+            cite = (
+                f"诗{poem_number}-{short}"
+                if poem_number is not None
+                else short
+            )
+            lines.append(f"[{cite}] {item['text']}")
     else:
         lines.append("(无赏析)")
 
@@ -190,14 +232,34 @@ def _summarize_observation(
         lines.append(f"注释共 {len(anno)} 条:")
         for item in anno:
             short = short_id(item["evidence_id"])
-            lines.append(f"[{short}] {item['text']}")
+            cite = (
+                f"诗{poem_number}-{short}"
+                if poem_number is not None
+                else short
+            )
+            lines.append(f"[{cite}] {item['text']}")
 
     return "\n".join(lines)
 
 
-def build_prompt(user_query: str, trajectory: list) -> str:
+def _session_poem_number(
+    session_poems: dict[int, str], poem_id: str | None
+) -> int | None:
+    """按真实 poem_id 反查会话诗序号。"""
+    for poem_number, known_poem_id in session_poems.items():
+        if known_poem_id == poem_id:
+            return poem_number
+    return None
+
+
+def build_prompt(
+    user_query: str,
+    trajectory: list,
+    session_poems: dict[int, str] | None = None,
+) -> str:
     """系统指令 + 观察轨迹 + 用户问题。"""
     parts = [SYSTEM_INSTRUCTION]
+    session_poems = session_poems or {}
 
     # 观察轨迹:把之前每步的 action + observation 回填,让模型看到进展
     if trajectory:
@@ -206,7 +268,9 @@ def build_prompt(user_query: str, trajectory: list) -> str:
             if "error" in step:
                 parts.append(f"[{i}] 错误:{step['error']}")
             else:
-                obs = _summarize_observation(step["observation"])
+                obs = _summarize_observation(
+                    step["observation"], session_poems=session_poems
+                )
                 parts.append(f'[{i}] 调用 {step["action"]}({step["input"]}) → {obs}')
 
     parts.append(f"\n## 用户问题\n{user_query}")

@@ -1,18 +1,19 @@
 """可信度层。★ 你亲手写。纵线阶段:先只做引用绑定。"""
 import re
-from .utils import short_id
 
-# 匹配 answer 里的引用标记,如 [appr-0]、[anno-12]、[appr-1-2]
-_CITE_PATTERN = re.compile(r"\[(appr|anno)[-\w]*\]")
-# 更精确地抽出方括号里的完整 id 主体(去掉方括号)
-_CITE_ID = re.compile(r"\[((?:appr|anno)[-\w]*)\]")
+# 抽出会话诗序号和诗内短 id，如 [诗1-appr-0]、[诗2-anno-12]。
+_SESSION_CITE = re.compile(r"\[诗(\d+)-((?:appr|anno)-[\w-]+)\]")
 
 
-def trustworthiness_check(answer: str, trajectory: list) -> dict:
+def trustworthiness_check(
+    answer: str,
+    trajectory: list,
+    session_poems: dict[int, str] | None = None,
+) -> dict:
     """finish 后必经此处。
     纵线阶段:把 answer 里引用到的证据块,从轨迹里捞出来附上(引用绑定)。
     后续增量:在这里加 no_hit / low_conf / 前提纠正 三种降级分支。"""
-    evidence = collect_evidence(answer, trajectory)
+    evidence = collect_evidence(answer, trajectory, session_poems or {})
     return {
         "answer": answer,
         "evidence": evidence,   # [{evidence_id, text, poem_id, title}]
@@ -20,41 +21,91 @@ def trustworthiness_check(answer: str, trajectory: list) -> dict:
     }
 
 
-def collect_evidence(answer: str, trajectory: list) -> list:
+def collect_evidence(
+    answer: str,
+    trajectory: list,
+    session_poems: dict[int, str] | None = None,
+) -> list:
     """★ 引用绑定核心:
-    1. 从 answer 里抽出所有被引用的 evidence_id(如 appr-0、anno-2);
-    2. 建一张 evidence_id → 完整块 的索引(遍历轨迹里 get_poem_detail 的观察);
-    3. 按 answer 里出现的引用,返回对应的完整证据块。
+    1. 从 answer 抽出所有 [诗N-appr-x]/[诗N-anno-x] 引用;
+    2. 用 N 经 session_poems 找 poem_id;
+    3. 用 poem_id + "#" + 诗内短 id 定位完整证据块。
     """
-    # 1. answer 里模型标注的引用 id(去重,保留出现顺序)
-    cited_ids: list[str] = []
-    for m in _CITE_ID.findall(answer):
-        if m not in cited_ids:
-            cited_ids.append(m)
+    session_poems = session_poems or {}
+    citations = _extract_session_citations(answer)
 
-    # 2. 从轨迹里建 evidence_id → 块 的全量索引
+    # 完整 evidence_id 全局唯一，因此索引不会再被跨诗短 id 覆盖。
     index = _build_evidence_index(trajectory)
 
-    # 3. 按引用捞块;引用了但索引里没有的,标记为"悬空引用"(模型幻觉的信号)
     evidence: list[dict] = []
-    for cid in cited_ids:
-        block = index.get(cid)
+    for poem_number, short_evidence_id in citations:
+        poem_id = session_poems.get(poem_number)
+        if poem_id is None:
+            evidence.append(
+                _dangling_evidence(
+                    poem_number,
+                    short_evidence_id,
+                    reason="引用了未取详情的诗",
+                )
+            )
+            continue
+
+        full_evidence_id = f"{poem_id}#{short_evidence_id}"
+        block = index.get(full_evidence_id)
         if block is not None:
-            evidence.append(block)
+            evidence.append({**block, "poem_number": poem_number})
         else:
-            evidence.append({
-                "evidence_id": cid,
-                "text": None,
-                "dangling": True,   # ← 模型引用了不存在的 id,可信度告警
-            })
+            evidence.append(
+                _dangling_evidence(
+                    poem_number,
+                    short_evidence_id,
+                    poem_id=poem_id,
+                    reason="段编号不存在",
+                )
+            )
     return evidence
 
 
+def _extract_session_citations(answer: str) -> list[tuple[int, str]]:
+    """提取引用并去重，同时保留它们在答案中的首次出现顺序。"""
+    citations: list[tuple[int, str]] = []
+    for poem_number, short_evidence_id in _SESSION_CITE.findall(answer):
+        citation = (int(poem_number), short_evidence_id)
+        if citation not in citations:
+            citations.append(citation)
+    return citations
+
+
+def _dangling_evidence(
+    poem_number: int,
+    short_evidence_id: str,
+    *,
+    reason: str,
+    poem_id: str | None = None,
+) -> dict:
+    """统一构造两类悬空引用，保留模型原始的会话引用以便排查。"""
+    return {
+        "evidence_id": (
+            f"{poem_id}#{short_evidence_id}"
+            if poem_id is not None
+            else short_evidence_id
+        ),
+        "text": None,
+        "poem_id": poem_id,
+        "poem_number": poem_number,
+        "citation": f"诗{poem_number}-{short_evidence_id}",
+        "dangling": True,
+        "reason": reason,
+    }
+
+
 def _build_evidence_index(trajectory: list) -> dict:
-    """遍历轨迹里所有 get_poem_detail 的观察,建 evidence_id → 完整块 索引。
+    """遍历轨迹里所有 get_poem_detail 观察，建完整 evidence_id → 块索引。
     块里带上 poem_id/title,方便前端显示'出自哪首诗'。"""
     index: dict[str, dict] = {}
     for step in trajectory:
+        if step.get("action") != "get_poem_detail":
+            continue
         obs = step.get("observation")
         if not isinstance(obs, dict) or "error" in obs:
             continue
@@ -64,8 +115,7 @@ def _build_evidence_index(trajectory: list) -> dict:
             for item in obs.get(key, []):
                 full_id = item.get("evidence_id")
                 if not full_id: continue
-                short = short_id(full_id)
-                index[short] = {
+                index[full_id] = {
                     "evidence_id": full_id,
                     "text": item["text"],
                     "poem_id": poem_id,
