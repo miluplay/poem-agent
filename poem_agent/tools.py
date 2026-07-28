@@ -131,34 +131,41 @@ def _semantic_scores(query: str) -> dict[str, float]:
     return scores
 
 
-def _title_matches(query: str) -> list[dict]:
-    """查找标题精确或包含命中，复用 store 的标题归一化规则。"""
-    poems = store.load_poems()
-    found: list[dict] = []
-    seen: set[str] = set()
+def _is_exact_title_match(
+    normalized_title: str, normalized_query: str
+) -> bool:
+    """判断已归一化的标题与查询是否完全相等。"""
+    return bool(normalized_query) and normalized_title == normalized_query
 
-    exact = store.find_by_title(query)
-    if exact is not None:
-        found.append(exact)
-        seen.add(exact["poem_id"])
 
+def _is_partial_title_match(
+    normalized_title: str, normalized_query: str
+) -> bool:
+    """判断已归一化的标题是否包含查询，但排除完全相等。"""
+    return (
+        bool(normalized_query)
+        and normalized_title != normalized_query
+        and normalized_query in normalized_title
+    )
+
+
+def _title_matches(query: str) -> tuple[list[dict], list[dict]]:
+    """按精确、部分两级查找标题命中，复用 store 的归一化规则。"""
     normalized_query = store._normalize_title(query)
-    for poem in poems:
+    exact_matches: list[dict] = []
+    partial_matches: list[dict] = []
+
+    for poem in store.load_poems():
         title = poem.get("title")
         if not isinstance(title, str):
             continue
         normalized_title = store._normalize_title(title)
-        if (
-            poem["poem_id"] not in seen
-            and normalized_title
-            and (
-                normalized_title in normalized_query
-                or normalized_query in normalized_title
-            )
-        ):
-            found.append(poem)
-            seen.add(poem["poem_id"])
-    return found
+        if _is_exact_title_match(normalized_title, normalized_query):
+            exact_matches.append(poem)
+        elif _is_partial_title_match(normalized_title, normalized_query):
+            partial_matches.append(poem)
+
+    return exact_matches, partial_matches
 
 
 def search_poems(query: str, top_k: int = 5) -> list[dict]:
@@ -169,9 +176,9 @@ def search_poems(query: str, top_k: int = 5) -> list[dict]:
         raise ValueError("top_k 必须是正整数")
 
     query = query.strip()
-    title_matches = _title_matches(query)
-    if len(title_matches) == 1:
-        poem = title_matches[0]
+    exact_title_matches, partial_title_matches = _title_matches(query)
+    if len(exact_title_matches) == 1:
+        poem = exact_title_matches[0]
         return [
             {
                 "poem_id": poem["poem_id"],
@@ -185,7 +192,13 @@ def search_poems(query: str, top_k: int = 5) -> list[dict]:
 
     poems_by_id = {poem["poem_id"]: poem for poem in store.load_poems()}
     query_authors, query_dynasties, query_tags = _extract_query_terms(query)
-    title_ids = {poem["poem_id"] for poem in title_matches}
+    exact_title_ids = {
+        poem["poem_id"] for poem in exact_title_matches
+    }
+    partial_title_ids = {
+        poem["poem_id"] for poem in partial_title_matches
+    }
+    title_ids = exact_title_ids | partial_title_ids
     semantic_scores = _semantic_scores(query)
 
     candidates: list[dict] = []
@@ -197,7 +210,9 @@ def search_poems(query: str, top_k: int = 5) -> list[dict]:
         ):
             continue
 
-        is_title_match = poem_id in title_ids
+        is_exact_title_match = poem_id in exact_title_ids
+        is_partial_title_match = poem_id in partial_title_ids
+        is_title_match = is_exact_title_match or is_partial_title_match
         semantic_score = 1.0 if is_title_match else semantic_scores[poem_id]
         tag_score = _calculate_tag_score(poem, query_tags)
         candidates.append(
@@ -214,23 +229,29 @@ def search_poems(query: str, top_k: int = 5) -> list[dict]:
                     if tag_score > 0
                     else "semantic"
                 ),
-                "_title_match": is_title_match,
+                "_title_match_rank": (
+                    0
+                    if is_exact_title_match
+                    else 1
+                    if is_partial_title_match
+                    else 2
+                ),
             }
         )
 
-    # 标题命中始终置顶；同一层级按融合分降序、诗库顺序稳定打破平分。
+    # 精确标题、部分标题、语义结果依次置顶；层内沿用原有次级排序。
     poem_order = {
         poem["poem_id"]: index for index, poem in enumerate(store.load_poems())
     }
     candidates.sort(
         key=lambda item: (
-            not item["_title_match"],
+            item["_title_match_rank"],
             -item["score"],
             poem_order[item["poem_id"]],
         )
     )
     for item in candidates:
-        del item["_title_match"]
+        del item["_title_match_rank"]
     return candidates[:top_k]
 
 

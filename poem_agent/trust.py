@@ -1,8 +1,68 @@
 """可信度层。★ 你亲手写。纵线阶段:先只做引用绑定。"""
 import re
+from collections.abc import Callable
 
 # 抽出会话诗序号和诗内短 id，如 [诗1-appr-0]、[诗2-anno-12]。
 _SESSION_CITE = re.compile(r"\[诗(\d+)-((?:appr|anno)-[\w-]+)\]")
+_MIN_ANSWER_LENGTH = 10
+
+
+def is_answer_suspiciously_incomplete(answer: str) -> bool:
+    """判断模型答案是否疑似被截断；这里只检查形态，不改写正常答案。"""
+    if not isinstance(answer, str):
+        return True
+    stripped = answer.strip()
+    return (
+        not stripped
+        or stripped.startswith("[")
+        or len(stripped) < _MIN_ANSWER_LENGTH
+    )
+
+
+def answer_integrity_gate(
+    answer: str,
+    regenerate: Callable[[], str],
+    trajectory: list,
+    *,
+    verbose: bool = False,
+) -> tuple[str, bool]:
+    """在答案返回前做一次完整性闸门，异常时仅重试一次，再失败则诚实降级。
+
+    返回 ``(最终答案, 是否降级)``；正常答案及重试成功的答案都保持原文。
+    """
+    if not is_answer_suspiciously_incomplete(answer):
+        return answer, False
+
+    if verbose:
+        print("          [完整性检查] 检测到答案疑似截断,重试")
+    retried_answer = regenerate()
+    if not is_answer_suspiciously_incomplete(retried_answer):
+        return retried_answer, False
+
+    if verbose:
+        print("          [完整性检查] 检测到答案疑似截断,降级")
+    titles = _collected_poem_titles(trajectory)
+    title_list = "、".join(f"《{title}》" for title in titles) or "（暂无）"
+    fallback = (
+        f"生成回答时出现异常,已获取的资料涉及:{title_list}。\n"
+        "请重试,或追问具体某一首诗。"
+    )
+    return fallback, True
+
+
+def _collected_poem_titles(trajectory: list) -> list[str]:
+    """从成功取得详情的轨迹中按首次出现顺序收集诗名。"""
+    titles: list[str] = []
+    for step in trajectory:
+        if step.get("action") != "get_poem_detail":
+            continue
+        observation = step.get("observation")
+        if not isinstance(observation, dict) or "error" in observation:
+            continue
+        title = observation.get("title")
+        if isinstance(title, str) and title.strip() and title.strip() not in titles:
+            titles.append(title.strip())
+    return titles
 
 
 def trustworthiness_check(

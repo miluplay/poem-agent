@@ -5,7 +5,7 @@ import os
 import re
 
 from .tools import TOOLS
-from .trust import trustworthiness_check
+from .trust import answer_integrity_gate, trustworthiness_check
 from .utils import short_id
 
 MAX_STEPS = 6
@@ -54,9 +54,16 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
         if decision["action"] == "finish":
             if verbose:
                 _print_final_separator()
-            return trustworthiness_check(
-                decision["action_input"]["answer"], trajectory, session_poems
+            answer, degraded = answer_integrity_gate(
+                decision["action_input"].get("answer", ""),
+                lambda: _extract_finish_answer(llm.generate(prompt)),
+                trajectory,
+                verbose=verbose,
             )
+            result = trustworthiness_check(answer, trajectory, session_poems)
+            if degraded:
+                result["degraded"] = True
+            return result
 
         # 5. 校验工具
         tool = TOOLS.get(decision["action"])
@@ -191,7 +198,16 @@ def force_finish(
 
     raw_answer = llm.generate(prompt)
     answer = _extract_force_finish_answer(raw_answer)
-    return trustworthiness_check(answer, trajectory, session_poems)
+    answer, degraded = answer_integrity_gate(
+        answer,
+        lambda: _extract_force_finish_answer(llm.generate(prompt)),
+        trajectory,
+        verbose=verbose,
+    )
+    result = trustworthiness_check(answer, trajectory, session_poems)
+    if degraded:
+        result["degraded"] = True
+    return result
 
 
 def build_force_finish_prompt(
@@ -227,10 +243,16 @@ def _extract_force_finish_answer(raw: str) -> str:
 
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
-    return (
-        "已达到步数上限，当前没有找到可用资料，因此无法给出有依据的解读。"
-        "请核对诗名、作者或关键字后再追问。"
-    )
+    return ""
+
+
+def _extract_finish_answer(raw: str) -> str:
+    """从正常 finish 的重试响应中提取答案；非法响应交给完整性闸门降级。"""
+    decision = parse_decision(raw)
+    if decision is None or decision["action"] != "finish":
+        return ""
+    answer = decision["action_input"].get("answer")
+    return answer if isinstance(answer, str) else ""
 
 
 def _assign_session_poem(
