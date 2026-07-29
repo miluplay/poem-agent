@@ -5,11 +5,23 @@ import json
 import os
 import re
 
+from ..analysis_support import (
+    AnalysisAssessmentProtocolError,
+    append_required_support_notice,
+    evaluate_analysis_support,
+    force_fallback_analysis_support,
+    required_support_notice,
+    validate_analysis_assessment,
+)
 from ..candidate_pool import CandidatePool, CandidatePoolProtocolError
 from ..tools import TOOLS
 from ..trust import (
-    answer_integrity_gate,
-    trustworthiness_check,
+    _append_degraded_notice,
+    _strip_invalid_citation_markers,
+    answer_integrity_fallback,
+    collect_evidence,
+    is_answer_suspiciously_incomplete,
+    list_dangling_citations,
 )
 from .display import (
     _print_final_separator,
@@ -86,29 +98,35 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
         if verbose:
             _print_step_decision(total_steps, decision)
 
-        # 4. 终止:模型认为够了 → 进答案完整性与引用可信性检查
+        # 4. 终止：协议合法后才计正常步，并进入一次统一终检。
         if decision["action"] == "finish":
+            try:
+                finish_payload = validate_analysis_assessment(
+                    decision["action_input"], candidate_pool
+                )
+            except AnalysisAssessmentProtocolError as exc:
+                error = f"finish 协议错误: {exc}"
+                trajectory.append({"error": error})
+                recovery_steps += 1
+                if verbose:
+                    _print_observation(f"错误：{error}")
+                continue
             productive_steps += 1
             if verbose:
                 _print_final_separator()
-            regenerate = lambda feedback="": _extract_finish_answer(
-                llm.generate(_append_regeneration_feedback(prompt, feedback))
+            regenerate = lambda feedback: _extract_finish_payload(
+                llm.generate(_append_regeneration_feedback(prompt, feedback)),
+                candidate_pool,
             )
-            answer, degraded = answer_integrity_gate(
-                decision["action_input"].get("answer", ""),
+            result = _unified_final_check(
+                finish_payload,
+                None,
                 regenerate,
                 trajectory,
-                verbose=verbose,
-            )
-            result = trustworthiness_check(
-                answer,
-                trajectory,
                 session_poems,
-                regenerate=regenerate,
+                candidate_pool,
                 verbose=verbose,
             )
-            if degraded:
-                result["degraded"] = True
             return _with_candidate_pool(result, candidate_pool)
 
         # 5. Candidate Pool 是主循环局部持有的一次性有状态动作，不进 TOOLS。
@@ -322,7 +340,7 @@ def force_finish(
     candidate_pool: CandidatePool | None = None,
     verbose: bool = False,
 ) -> dict:
-    """步数耗尽时强制作答，并沿用正常 finish 的引用可信性检查。"""
+    """步数耗尽时强制作答，并沿用正常 finish 的统一终检。"""
     prompt = build_force_finish_prompt(
         user_query,
         trajectory,
@@ -338,25 +356,23 @@ def force_finish(
         _print_final_separator()
 
     raw_answer = llm.generate(prompt)
-    answer = _extract_force_finish_answer(raw_answer)
-    regenerate = lambda feedback="": _extract_force_finish_answer(
-        llm.generate(_append_regeneration_feedback(prompt, feedback))
+    payload, payload_error = _extract_force_finish_payload(
+        raw_answer, candidate_pool
     )
-    answer, degraded = answer_integrity_gate(
-        answer,
+    regenerate = lambda feedback: _extract_force_finish_payload(
+        llm.generate(_append_regeneration_feedback(prompt, feedback)),
+        candidate_pool,
+    )
+    result = _unified_final_check(
+        payload,
+        payload_error,
         regenerate,
         trajectory,
-        verbose=verbose,
-    )
-    result = trustworthiness_check(
-        answer,
-        trajectory,
         session_poems,
-        regenerate=regenerate,
+        candidate_pool,
+        force=True,
         verbose=verbose,
     )
-    if degraded:
-        result["degraded"] = True
     return _with_candidate_pool(result, candidate_pool)
 
 
@@ -374,43 +390,218 @@ def _with_candidate_pool(
     }
 
 
-def _extract_force_finish_answer(raw: str) -> str:
-    """兼容模型仍按旧协议返回 finish JSON 的情况,否则保留回答原文。"""
+def _extract_force_finish_payload(
+    raw: str, candidate_pool: CandidatePool | None
+) -> tuple[dict | None, str | None]:
+    """读取强制收尾紧凑结构，并兼容 action=finish 包装。"""
     decision = parse_decision(raw)
-    if decision is not None:
-        if decision["action"] == "finish":
-            answer = decision["action_input"].get("answer")
-            if isinstance(answer, str) and answer.strip():
-                return answer
-        # force_finish 阶段不再接受新的工具决策,避免把决策 JSON 当答案返回。
+    if decision is not None and decision["action"] == "finish":
+        action_input = decision["action_input"]
+    else:
+        obj = _parse_json_object(raw)
+        action_input = obj if isinstance(obj, dict) else {}
+    try:
+        return validate_analysis_assessment(action_input, candidate_pool), None
+    except AnalysisAssessmentProtocolError as exc:
+        answer = action_input.get("answer", "") if isinstance(action_input, dict) else ""
         return (
-            "已达到步数上限。这是基于现有信息的初步回答；模型未能形成最终作答。"
-            "请补充准确的诗名、作者或希望分析的角度后继续追问。"
+            {
+                "answer": answer if isinstance(answer, str) else "",
+                "analysis_assessment": None,
+            },
+            f"强制收尾 assessment 非法: {exc}",
         )
 
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    return ""
 
-
-def _extract_finish_answer(raw: str) -> str:
-    """从正常 finish 的重试响应中提取答案；非法响应交给完整性闸门降级。"""
+def _extract_finish_payload(
+    raw: str, candidate_pool: CandidatePool | None
+) -> tuple[dict | None, str | None]:
+    """统一重生成只接受完整、精确的正常 finish 协议。"""
     decision = parse_decision(raw)
     if decision is None or decision["action"] != "finish":
-        return ""
-    answer = decision["action_input"].get("answer")
-    return answer if isinstance(answer, str) else ""
+        return None, "重生成必须返回 action=finish 的 JSON"
+    try:
+        return (
+            validate_analysis_assessment(
+                decision["action_input"], candidate_pool
+            ),
+            None,
+        )
+    except AnalysisAssessmentProtocolError as exc:
+        answer = decision["action_input"].get("answer", "")
+        return (
+            {
+                "answer": answer if isinstance(answer, str) else "",
+                "analysis_assessment": None,
+            },
+            f"重生成 finish 协议错误: {exc}",
+        )
 
 
 def _append_regeneration_feedback(prompt: str, feedback: str) -> str:
-    """有修正反馈时追加到原 prompt；完整性重试则保持原 prompt 不变。"""
-    if not feedback:
-        return prompt
+    """追加一次统一终检的全部修正反馈。"""
     return (
-        f"{prompt}\n\n## 上一次答案的引用修正反馈\n{feedback}\n"
-        "请立刻按反馈重新作答。正常 finish 流程仍只输出 action=finish 的"
-        " JSON；步数耗尽流程仍只输出最终回答正文。"
+        f"{prompt}\n\n## 统一终检反馈\n{feedback}\n"
+        "请一次性重新生成完整 answer 和仅含 level、target_ids 的 "
+        "analysis_assessment。正常流程输出 action=finish 包装；步数耗尽流程"
+        "可输出紧凑的 answer + analysis_assessment 对象。不要再调用工具。"
     )
+
+
+def _unified_final_check(
+    payload: dict | None,
+    payload_error: str | None,
+    regenerate,
+    trajectory: list,
+    session_poems: dict[int, str],
+    candidate_pool: CandidatePool | None,
+    *,
+    force: bool = False,
+    verbose: bool = False,
+) -> dict:
+    """完整性、引用和支撑申报共享至多一次重生成预算。"""
+    original_payload = payload
+    issues, _ = _inspect_final_payload(
+        payload,
+        payload_error,
+        trajectory,
+        session_poems,
+        candidate_pool,
+    )
+    if issues:
+        if verbose:
+            print("          [统一终检] 检测到问题，合并反馈后重试一次")
+        feedback = "\n".join(f"- {issue}" for issue in issues)
+        payload, payload_error = regenerate(feedback)
+
+    # 正常 finish 初始 assessment 必然合法；重生成协议失败时仍可使用原申报。
+    if (
+        (payload is None or payload.get("analysis_assessment") is None)
+        and not force
+        and original_payload is not None
+    ):
+        payload = {
+            "answer": (
+                payload.get("answer", "")
+                if isinstance(payload, dict)
+                else ""
+            ),
+            "analysis_assessment": original_payload["analysis_assessment"],
+        }
+    answer = (
+        payload.get("answer", "")
+        if isinstance(payload, dict)
+        and isinstance(payload.get("answer"), str)
+        else ""
+    )
+    assessment = (
+        payload.get("analysis_assessment")
+        if isinstance(payload, dict)
+        else None
+    )
+
+    degraded = False
+    if is_answer_suspiciously_incomplete(answer):
+        answer = answer_integrity_fallback(trajectory)
+        degraded = True
+        if verbose:
+            print("          [统一终检] 重试后答案仍不完整，安全降级")
+
+    answer = _strip_invalid_citation_markers(answer)
+    evidence = collect_evidence(answer, trajectory, session_poems)
+    dangling = list_dangling_citations(evidence)
+    if dangling:
+        degraded = True
+        answer = _append_degraded_notice(answer)
+        if verbose:
+            print("          [统一终检] 重试后仍有悬空引用，安全降级")
+
+    if assessment is None:
+        analysis_support = force_fallback_analysis_support()
+    else:
+        evaluation = evaluate_analysis_support(
+            assessment,
+            candidate_pool,
+            evidence,
+            degraded=degraded,
+        )
+        analysis_support = evaluation.analysis_support
+    answer = append_required_support_notice(answer, analysis_support)
+    return {
+        "answer": answer,
+        "evidence": evidence,
+        "analysis_support": analysis_support,
+        "degraded": degraded,
+    }
+
+
+def _inspect_final_payload(
+    payload: dict | None,
+    payload_error: str | None,
+    trajectory: list,
+    session_poems: dict[int, str],
+    candidate_pool: CandidatePool | None,
+) -> tuple[list[str], dict | None]:
+    """收集一次终检的全部可修正问题，不产生状态修改。"""
+    issues: list[str] = []
+    if payload_error:
+        issues.append(payload_error)
+    if payload is None:
+        issues.append("未形成可检查的最终回答结构")
+        return issues, None
+
+    answer = payload.get("answer", "")
+    if is_answer_suspiciously_incomplete(answer):
+        issues.append("answer 为空、过短或疑似截断，请重新生成完整回答")
+    cleaned_answer = _strip_invalid_citation_markers(
+        answer if isinstance(answer, str) else ""
+    )
+    evidence = collect_evidence(cleaned_answer, trajectory, session_poems)
+    dangling = list_dangling_citations(evidence)
+    if dangling:
+        issues.append(
+            "存在悬空引用，请删除或改用真实依据："
+            + "；".join(dangling)
+        )
+
+    assessment = payload.get("analysis_assessment")
+    if not isinstance(assessment, dict):
+        issues.append("analysis_assessment 缺失或非法")
+        return issues, None
+    evaluation = evaluate_analysis_support(
+        assessment, candidate_pool, evidence, degraded=False
+    )
+    if evaluation.analysis_support["level"] != assessment["level"]:
+        limited = [
+            f"target {target_id}={state}"
+            for target_id, state in evaluation.target_states.items()
+            if state != "fully_supported"
+        ]
+        detail = "、".join(limited) or "当前没有合法分析 evidence"
+        issues.append(
+            f"申报 level={assessment['level']} 超过系统客观上限 "
+            f"{evaluation.maximum}；{detail}"
+        )
+    notice = required_support_notice(evaluation.analysis_support)
+    if notice is not None and notice not in cleaned_answer.splitlines():
+        issues.append(f"回答必须披露固定说明：{notice}")
+    return issues, evaluation.analysis_support
+
+
+def _parse_json_object(raw: str) -> dict | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    obj = _try_json(text)
+    if isinstance(obj, dict):
+        return obj
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        obj = _try_json(text[start : end + 1])
+    return obj if isinstance(obj, dict) else None
 
 
 def _assign_session_poem(

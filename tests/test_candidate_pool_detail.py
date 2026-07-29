@@ -61,7 +61,26 @@ def get(poem_id):
 
 
 def finish(answer="这是完整且可返回的测试回答。"):
-    return {"action": "finish", "action_input": {"answer": answer}}
+    return {
+        "action": "finish",
+        "action_input": {
+            "answer": answer,
+            "analysis_assessment": {
+                "level": "not_applicable",
+                "target_ids": [],
+            },
+        },
+    }
+
+
+def forced(answer):
+    return {
+        "answer": answer,
+        "analysis_assessment": {
+            "level": "not_applicable",
+            "target_ids": [],
+        },
+    }
 
 
 class FakeLLM:
@@ -424,7 +443,7 @@ class DetailPoolAgentTests(unittest.TestCase):
                 init([{"author": "甲"}]),
                 get("outside"),
                 get("outside-again"),
-                "强制收尾后的完整测试回答。",
+                forced("强制收尾后的完整测试回答。"),
             ]
         )
         with patch(
@@ -490,7 +509,7 @@ class DetailPoolAgentTests(unittest.TestCase):
             [
                 init([{"author": "甲"}]),
                 *[get(poem_id) for poem_id in ids],
-                forced_answer,
+                forced(forced_answer),
             ]
         )
         tool = Mock(side_effect=[detail(poem_id) for poem_id in ids])
@@ -517,7 +536,7 @@ class DetailPoolAgentTests(unittest.TestCase):
     def test_total_step_guard_has_no_off_by_one(self):
         unknown = {"action": "unknown", "action_input": {}}
         forced_answer = "八轮动作硬上限后的强制收尾回答。"
-        llm = FakeLLM([*[unknown for _ in range(8)], forced_answer])
+        llm = FakeLLM([*[unknown for _ in range(8)], forced(forced_answer)])
 
         # 单独放宽两个较小熔断，只隔离验证总轮次 guard 本身。
         with (

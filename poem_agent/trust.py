@@ -46,13 +46,17 @@ def answer_integrity_gate(
 
     if verbose:
         print("          [完整性检查] 检测到答案疑似截断,降级")
+    return answer_integrity_fallback(trajectory), True
+
+
+def answer_integrity_fallback(trajectory: list) -> str:
+    """构造完整性重试仍失败时的稳定安全回答。"""
     titles = _collected_poem_titles(trajectory)
     title_list = "、".join(f"《{title}》" for title in titles) or "（暂无）"
-    fallback = (
+    return (
         f"生成回答时出现异常,已获取的资料涉及:{title_list}。\n"
         "请重试,或追问具体某一首诗。"
     )
-    return fallback, True
 
 
 def _collected_poem_titles(trajectory: list) -> list[str]:

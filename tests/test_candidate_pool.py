@@ -39,7 +39,13 @@ def finish_decision(answer="这是基于当前候选池生成的完整回答。"
     return {
         "thought": "完成",
         "action": "finish",
-        "action_input": {"answer": answer},
+        "action_input": {
+            "answer": answer,
+            "analysis_assessment": {
+                "level": "not_applicable",
+                "target_ids": [],
+            },
+        },
     }
 
 

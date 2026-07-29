@@ -80,8 +80,31 @@ detail_pool 已读作品的 target 覆盖和赏析/注释参考数量。两者�
 {
   "thought": "...",
   "action": "finish",
-  "action_input": {"answer": "回答；具体解读后标注 [诗1-appr-0] 等引用"}
+  "action_input": {
+    "answer": "回答；具体解读后标注 [诗1-appr-0] 等引用",
+    "analysis_assessment": {
+      "level": "sufficient",
+      "target_ids": [1]
+    }
+  }
 }
+finish.action_input 必须且只能包含 answer、analysis_assessment；
+analysis_assessment 必须且只能包含 level、target_ids。target_ids 是用户要求进行
+内容分析的 target 范围，不要提交 poem IDs、evidence IDs、factors、degraded
+或其他字段。not_applicable 必须使用空 target_ids；另外三级必须提交至少一个
+Candidate Pool 中真实且不重复的 target ID。只查找、列举、确认作者/朝代/标题
+等元信息时使用 not_applicable。
+
+analysis_assessment 只申报你基于当前资料能诚实支持的最小等级：
+- sufficient：详情和合法引用覆盖主要分析范围；仍须引用，且不要把文学解释写成
+  唯一客观事实。
+- partial：只分析有支撑部分，明确未覆盖对象或资料限制，使用“从现有资料看”
+  “就已取得的作品而言”等范围限定，不把局部结论推广到全部 targets。
+- insufficient：不要生成无依据的主体赏析；说明无法完成的原因，可提供已确认
+  元信息、搜索冲突、详情异常和下一步建议，不得用记忆补全。
+系统会从最终合法 evidence 反查实际作品和 targets，并结合池状态设置不可突破的
+客观上限。reference_verdict 中的参考量 limited 是必须考虑和披露的软因素，
+但窄而直接的分析仍可 sufficient；它不会被系统单独机械降级。
 
 ## 用户前提纠正
 只有 Candidate Pool 明确标为 conflict，且已经取得诊断候选详情时才能纠正用户；
@@ -143,7 +166,7 @@ def build_force_finish_prompt(
     session_poems: dict[int, str],
     candidate_pool: dict | None = None,
 ) -> str:
-    """构造只允许输出最终答案、不再调用动作的步数耗尽提示。"""
+    """构造只允许输出紧凑最终结构、不再调用动作的步数耗尽提示。"""
     return (
         build_prompt(
             user_query,
@@ -155,5 +178,8 @@ def build_force_finish_prompt(
         "已达到正常、恢复或总步数上限。请同时查看当前筛选池、详情池、搜索 "
         "verdict、reference_stats 和 reference_verdict，并基于已取得的详情给出最佳回答，"
         "诚实说明现有信息限制，并提示用户如何追问。仍须遵守引用规则，不得编造。"
-        "这一次不要再选择动作、不要输出 JSON，只输出最终回答正文。"
+        "这一次不要再选择工具动作；只输出紧凑 JSON："
+        '{"answer":"基于现有资料的最终回答……","analysis_assessment":'
+        '{"level":"partial","target_ids":[1]}}。assessment 仍必须遵守 finish 的'
+        "两字段规则。也兼容 action=finish 包装，但不要输出裸文本。"
     )

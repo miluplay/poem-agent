@@ -66,14 +66,22 @@ class SessionCitationTests(unittest.TestCase):
                     "thought": "首次作答",
                     "action": "finish",
                     "action_input": {
-                        "answer": "这是一段带悬空引用的完整解读 [诗1-appr-99]"
+                        "answer": "这是一段带悬空引用的完整解读 [诗1-appr-99]",
+                        "analysis_assessment": {
+                            "level": "sufficient",
+                            "target_ids": [1],
+                        },
                     },
                 },
                 {
                     "thought": "修正引用",
                     "action": "finish",
                     "action_input": {
-                        "answer": "这是一段已修正引用的完整解读 [诗1-appr-0]"
+                        "answer": "这是一段已修正引用的完整解读 [诗1-appr-0]",
+                        "analysis_assessment": {
+                            "level": "sufficient",
+                            "target_ids": [1],
+                        },
                     },
                 },
             ]
@@ -131,7 +139,13 @@ class SessionCitationTests(unittest.TestCase):
                 {
                     "thought": "作答",
                     "action": "finish",
-                    "action_input": {"answer": "解读 [诗1-appr-0]"},
+                    "action_input": {
+                        "answer": "这是完整解读 [诗1-appr-0]",
+                        "analysis_assessment": {
+                            "level": "sufficient",
+                            "target_ids": [1],
+                        },
+                    },
                 },
             ]
         )
@@ -205,7 +219,13 @@ class SessionCitationTests(unittest.TestCase):
                 {
                     "thought": "作答",
                     "action": "finish",
-                    "action_input": {"answer": "甲诗解读 [诗1-appr-0]"},
+                    "action_input": {
+                        "answer": "这是甲诗解读 [诗1-appr-0]",
+                        "analysis_assessment": {
+                            "level": "sufficient",
+                            "target_ids": [1],
+                        },
+                    },
                 },
             ]
         )

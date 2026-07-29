@@ -9,6 +9,8 @@ chroma/
 CXtask.md
 test.py
 tests/*
+!tests/test_analysis_support.py
+!tests/test_answer_integrity.py
 !tests/test_candidate_pool.py
 !tests/test_candidate_pool_detail.py
 /规划/

@@ -316,7 +316,13 @@ class PromptAndAgentRegressionTests(unittest.TestCase):
                 decision(
                     "依据详情纠正作者",
                     "finish",
-                    {"answer": "《春望》的作者是杜甫，并非李白。"},
+                    {
+                        "answer": "《春望》的作者是杜甫，并非李白。",
+                        "analysis_assessment": {
+                            "level": "not_applicable",
+                            "target_ids": [],
+                        },
+                    },
                 ),
             ]
         )

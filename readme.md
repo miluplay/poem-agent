@@ -11,12 +11,13 @@
 - **筛选池与详情池**：完整轻量候选、排序和 target 关联永久保留；成功读取的唯一作品原子进入详情池，已读或隔离候选会推动默认 5 项窗口滚动。
 - **客观搜索状态**：逐 target 计算 `matched`、`partial_match`、`conflict`、`missing` 或 `not_applicable`，由系统生成固定 verdict。
 - **客观参考量画像**：按全语料赏析/注释数量的下四分位数（当前分别为 4/5），提供逐诗、逐 target、全池统计和独立 `reference_verdict`。
+- **任务相关分析支撑**：模型只申报分析等级和 target 范围；系统从最终合法 evidence 反查实际作品，结合 Candidate Pool 计算不可突破的客观上限，稳定返回 `analysis_support`。
 - **多步 Agent**：手写 `thought → action → observation` 循环，不依赖 Agent 框架；正常决策最多 6 步、恢复决策最多 2 步，总决策最多 8 步。
 - **多诗任务**：作者、朝代、标题和主题的对象关系保存在同一 target，可在一次初始化中处理多首作品，再分别读取详情。
 - **可核对引用**：解读使用 `[诗N-appr-x]` 或 `[诗N-note-x]`，最终映射到完整 `evidence_id` 和原始证据文本。
 - **错误前提纠正**：用户给出的标题、作者或朝代与检索结果冲突时，基于已取回的详情纠正。
 - **防空转与兜底**：拦截完全重复的工具调用；连续无有效结果或达到步数上限时停止继续检索。
-- **答案质量闸门**：检测空答案或疑似截断，自动重试一次；悬空引用会携带具体反馈重新生成，仍失败则显式降级。
+- **统一最终检查**：一次收集空白/截断、悬空引用和分析支撑过度申报，最多合并重生成一次；仍有完整性或引用问题才设置 `degraded`。
 - **CLI 与 JSON 输出**：支持单次问答、交互模式、完整 JSON 结果以及可视化 Agent 轨迹。
 
 ## 工作流程
@@ -33,10 +34,11 @@
    └── finish
           │
           ▼
-完整性检查 ──► 引用绑定 ──► 悬空引用修正 ──► 降级信息
+统一终检：完整性 + 引用绑定 + analysis_support 客观上限
+          └── 有问题时最多合并重生成一次
           │
           ▼
-最终回答 + evidence + Candidate Pool 精简快照
+最终回答 + evidence + Candidate Pool 精简快照 + analysis_support
 ```
 
 ### 检索策略
@@ -69,6 +71,10 @@ Agent 只能对当前 `visible_candidate_ids` 调用 `get_poem_detail`。成功�
 
 合法详情 `not_found` 会对同一 ID 自动重试一次；连续失败后隔离该 ID，并对每个关联 target 至多受控重筛一次。工具异常同样只重试一次，仍异常则直接向上抛出。
 
+正常 `finish` 的 `action_input` 只允许 `answer` 和 `analysis_assessment`；后者只允许 `level` 与 `target_ids`。等级固定为 `not_applicable`、`sufficient`、`partial`、`insufficient`。系统不相信模型提交作品 ID，而是从最终非悬空 evidence 的真实 `poem_id` 反查详情池及 target 关联。`matched` 且有详情和合法依据可达到 sufficient；`partial_match`、`conflict`、未覆盖或详情不可用会限制上限；完全没有合法分析依据时为 insufficient。仅主题 target 不会因搜索层的 `not_applicable` 自动失去支撑资格。
+
+参考量 `limited` 是透明披露的软因素，不会单独机械下调 sufficient。模型可以主动申报更保守的等级，系统只会下调过度申报、不会主动上调。partial/insufficient 的固定分析支撑说明会确定性出现在回答中。分析支撑不足本身不设置 `degraded`；该布尔值仍只表示答案完整性或引用安全降级。
+
 ## 项目结构
 
 ```text
@@ -80,6 +86,7 @@ Agent 只能对当前 `visible_candidate_ids` 调用 `get_poem_detail`。成功�
 │   └── build_index.py           # 构建正文/赏析 Chroma 索引
 ├── poem_agent/
 │   ├── candidate_pool.py            # 筛选池、详情池、覆盖与两类客观画像
+│   ├── analysis_support.py           # finish 协议、逐 target 支撑与客观上限
 │   ├── agent/
 │   │   ├── __init__.py          # Agent 主循环、解析、防空转与强制收尾
 │   │   ├── prompts.py           # 系统指令和 Prompt 构造
@@ -91,7 +98,7 @@ Agent 只能对当前 `visible_candidate_ids` 调用 `get_poem_detail`。成功�
 │   ├── retrieval/
 │   │   └── engine.py            # 标题、语义、标签混合检索
 │   ├── store.py                 # poems.json 加载与基础查询
-│   ├── trust.py                 # 完整性、引用绑定、悬空修正和降级检查
+│   ├── trust.py                 # 完整性与引用绑定底层函数、降级提示
 │   └── utils.py
 ├── .env.example
 └── requirements.txt
@@ -164,7 +171,7 @@ python main.py -v "比较《静夜思》和《春望》的情感"
 # verbose 也可以通过环境变量开启
 POEM_AGENT_VERBOSE=1 python main.py "赏析《蜀道难》"
 
-# 输出 answer、evidence、candidate_pool、degraded 等完整 JSON
+# 输出 answer、evidence、candidate_pool、analysis_support、degraded 等完整 JSON
 python main.py --json "赏析《蜀道难》"
 
 # 调整请求超时
@@ -265,15 +272,21 @@ python scripts/build_index.py \
     },
     "reference_verdict": "尚未读取作品详情，参考量未评估。"
   },
+  "analysis_support": {
+    "level": "sufficient",
+    "target_ids": [1],
+    "verdict": "现有详情与合法依据覆盖本次分析范围。"
+  },
   "degraded": false
 }
 ```
 
-不需要诗词检索而直接结束的兼容路径会返回 `candidate_pool: null`。`degraded` 是布尔值：正常结果为 `false`；答案完整性或引用问题在自动重试后仍未解决时为 `true`。
+不需要诗词检索而直接结束的兼容路径会返回 `candidate_pool: null`，同时稳定返回 `analysis_support.level: "not_applicable"`。`analysis_support` 始终只包含 `level`、`target_ids`、`verdict` 三个字段。`degraded` 是布尔值：正常结果为 `false`；答案完整性或引用问题在统一重生成后仍未解决时为 `true`。
 
 ## 当前边界
 
 - 知识范围受 `data/poems.json` 限制，库外作品不会凭模型记忆补全。
 - 语义检索依赖本地 Chroma 索引和 BGE 模型；缺少索引时无法完成普通语义检索。
-- 阶段 1 的 `theme_coverage` 固定为 `null`，不宣称主题已完整满足；参考量统计和最终分析可信性属于后续阶段。
+- `theme_coverage` 仍固定为 `null`，不宣称系统已经计算主题覆盖；主题分析是否得到当前合法依据支撑由 `analysis_support` 单独表达。
 - 引用检查可以验证引用是否真实存在并绑定原文，但不能替代人工判断某段证据是否足以支持全部表述。
+- `analysis_support` 表示现有详情和合法依据对用户分析任务的覆盖范围，不是答案为真的概率、检索分数，也不表示文学解释唯一正确。
