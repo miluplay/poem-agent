@@ -195,6 +195,22 @@ def retrieve_poems(
     top_k: int = 5,
 ) -> list[dict]:
     """执行硬过滤 → 候选池 → 软排序 → 截断的统一检索管线。"""
+    return retrieve_all_poems(
+        query=query,
+        author=author,
+        dynasty=dynasty,
+        title=title,
+    )[:top_k]
+
+
+def retrieve_all_poems(
+    *,
+    query: str | None = None,
+    author: str | None = None,
+    dynasty: str | None = None,
+    title: str | None = None,
+) -> list[dict]:
+    """执行统一检索但不截断，供有状态 Candidate Pool 保存完整候选。"""
     poems = store.load_poems()
     candidates = _hard_filter(
         poems, author=author, dynasty=dynasty, title=title
@@ -204,7 +220,7 @@ def retrieve_poems(
 
     if query is None:
         return [
-            _lightweight_result(poem, None) for poem in candidates[:top_k]
+            _lightweight_result(poem, None) for poem in candidates
         ]
 
     candidate_ids = frozenset(
@@ -238,4 +254,4 @@ def retrieve_poems(
             poem_order[item["poem_id"]],
         )
     )
-    return ranked[:top_k]
+    return ranked

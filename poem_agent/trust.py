@@ -2,16 +2,11 @@
 import re
 from collections.abc import Callable
 
-# 分诗采信度阈值，集中定义以便后续 eval 校准。
-CONF_NORMAL = 0.6
-CONF_LOWCONF = 0.35
-
 # 对外只允许赏析和注释两类引用；宽匹配用于剥离模型自造的类似引用。
 _LEGAL_CITE = re.compile(r"\[诗\d+-(?:appr|note)-\d+\]")
 _CITE_LIKE = re.compile(r"\[诗\d+[^\]]*\]")
 _SESSION_CITE = re.compile(r"\[诗(\d+)-((?:appr|note)-\d+)\]")
 _MIN_ANSWER_LENGTH = 10
-_DANGLING_DEGRADED_REASON = "存在无法匹配出处的引用"
 _DANGLING_DEGRADED_NOTICE = (
     "（部分解读未能匹配到可靠出处，已尽力修正，请谨慎参考）"
 )
@@ -115,15 +110,9 @@ def trustworthiness_check(
             state = "重试后仍有" if regeneration_attempted else "存在"
             print(f"          [悬空引用检查] {state}悬空引用，降级")
 
-    confidence = compute_confidence(trajectory, session_poems)
-    if degraded:
-        confidence["degraded_reason"] = _DANGLING_DEGRADED_REASON
-    if verbose:
-        _print_confidence(confidence)
     return {
         "answer": answer,
         "evidence": evidence,   # [{evidence_id, text, poem_id, title}]
-        "confidence": confidence,
         "degraded": degraded,
     }
 
@@ -184,96 +173,6 @@ def _strip_invalid_citation_markers(answer: str) -> str:
     )
     cleaned = re.sub(r"[ \t]+(?=[，。！？；：、,.!?;:])", "", cleaned)
     return re.sub(r"[ \t]+$", "", cleaned, flags=re.MULTILINE)
-
-
-def compute_confidence(
-    trajectory: list,
-    session_poems: dict[int, str],
-) -> dict:
-    """按每首进入会话的诗计算检索采信度，不改变答案或降级状态。
-
-    每个 poem_id 取所有 ``search_poems`` 观察中的最高 score；从未在检索
-    结果中出现的诗按 0 分处理。诗序号和 poem_id 以 session_poems 为准，
-    标题则从成功的 ``get_poem_detail`` 观察中补齐。
-    """
-    highest_scores: dict[str, float] = {}
-    titles: dict[str, str] = {}
-
-    for step in trajectory:
-        action = step.get("action")
-        observation = step.get("observation")
-
-        if action == "search_poems" and isinstance(observation, list):
-            for candidate in observation:
-                if not isinstance(candidate, dict):
-                    continue
-                poem_id = candidate.get("poem_id")
-                score = candidate.get("score")
-                if (
-                    not isinstance(poem_id, str)
-                    or not isinstance(score, (int, float))
-                    or isinstance(score, bool)
-                ):
-                    continue
-                numeric_score = float(score)
-                highest_scores[poem_id] = max(
-                    highest_scores.get(poem_id, numeric_score),
-                    numeric_score,
-                )
-
-        elif (
-            action == "get_poem_detail"
-            and isinstance(observation, dict)
-            and "error" not in observation
-        ):
-            poem_id = observation.get("poem_id")
-            title = observation.get("title")
-            if isinstance(poem_id, str) and isinstance(title, str):
-                titles[poem_id] = title
-
-    confidence_table: dict[int, dict] = {}
-    for poem_number, poem_id in session_poems.items():
-        score = highest_scores.get(poem_id, 0.0)
-        confidence_table[poem_number] = {
-            "poem_id": poem_id,
-            "title": titles.get(poem_id),
-            "score": score,
-            "level": _confidence_level(score),
-        }
-
-    levels = [item["level"] for item in confidence_table.values()]
-    overall_level = (
-        min(levels, key={"normal": 2, "low_conf": 1, "no_hit": 0}.get)
-        if levels
-        else "no_hit"
-    )
-    return {
-        "confidence_table": confidence_table,
-        "overall_level": overall_level,
-    }
-
-
-def _confidence_level(score: float) -> str:
-    """把单首诗的最高检索分数映射为具名采信度等级。"""
-    if score >= CONF_NORMAL:
-        return "normal"
-    if score >= CONF_LOWCONF:
-        return "low_conf"
-    return "no_hit"
-
-
-def _print_confidence(confidence: dict) -> None:
-    """verbose 模式下打印便于人工核对的分诗采信度表。"""
-    table = confidence["confidence_table"]
-    if not table:
-        print("[采信度] 无诗 → overall=no_hit")
-        return
-    summaries = [
-        f'诗{poem_number}《{item["title"] or "未知标题"}》 '
-        f'score={item["score"]:.2f} → {item["level"]}'
-        for poem_number, item in table.items()
-    ]
-    print("[采信度] " + ";".join(summaries))
 
 
 def collect_evidence(

@@ -5,6 +5,7 @@ import json
 import os
 import re
 
+from ..candidate_pool import CandidatePool, CandidatePoolProtocolError
 from ..tools import TOOLS
 from ..trust import (
     answer_integrity_gate,
@@ -17,7 +18,6 @@ from .display import (
     _print_step_error,
 )
 from .observation import (
-    EMPTY_SEARCH_OBSERVATION,
     _session_poem_number,
     _summarize_observation,
 )
@@ -32,11 +32,11 @@ MAX_STEPS = 6
 
 REPEATED_ACTION_OBSERVATION = (
     "你刚才已经用相同参数执行过 {action},结果没有变化。请不要重复,"
-    "换一种查询,或基于已有信息作答/告知用户。"
+    "请基于 Candidate Pool 和已有详情继续或结束作答。"
 )
 STALLED_ACTION_OBSERVATION = (
-    "你已多次检索但未获得有效结果,请停止检索,"
-    "基于已有信息作答或告知用户找不到。"
+    "你已多次调用工具但未获得有效结果,请停止调用,"
+    "基于 Candidate Pool 和已有信息作答或告知用户找不到。"
 )
 
 
@@ -44,12 +44,22 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
     verbose = verbose or _env_flag_enabled("POEM_AGENT_VERBOSE")
     trajectory = []   # 观察轨迹:每步的 thought/action/observation
     session_poems: dict[int, str] = {}  # 会话诗序号 → poem_id
+    candidate_pool: CandidatePool | None = None
     seen_actions: set[tuple[str, str]] = set()
     stalled_action_counts: dict[str, int] = {}
 
     for step in range(MAX_STEPS):
         # 1. 构建 prompt(系统指令 + 工具描述 + 已有观察)
-        prompt = build_prompt(user_query, trajectory, session_poems)
+        prompt = build_prompt(
+            user_query,
+            trajectory,
+            session_poems,
+            candidate_pool=(
+                candidate_pool.model_snapshot()
+                if candidate_pool is not None
+                else None
+            ),
+        )
 
         # 2. LLM 决策,要求返回结构化 JSON
         decision = parse_decision(llm.generate(prompt))
@@ -65,7 +75,7 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
         if verbose:
             _print_step_decision(step + 1, decision)
 
-        # 4. 终止:模型认为够了 → 进可信度层
+        # 4. 终止:模型认为够了 → 进答案完整性与引用可信性检查
         if decision["action"] == "finish":
             if verbose:
                 _print_final_separator()
@@ -87,9 +97,59 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
             )
             if degraded:
                 result["degraded"] = True
-            return result
+            return _with_candidate_pool(result, candidate_pool)
 
-        # 5. 校验工具
+        # 5. Candidate Pool 是主循环局部持有的一次性有状态动作，不进 TOOLS。
+        if decision["action"] == "initialize_candidate_pool":
+            if candidate_pool is not None:
+                error = (
+                    "Candidate Pool 已成功初始化；同一 run 只允许成功初始化一次，"
+                    "原池保持不变"
+                )
+                trajectory.append({"error": error})
+                if verbose:
+                    _print_observation(f"错误：{error}")
+                continue
+            action_input = decision["action_input"]
+            if set(action_input) != {"targets"}:
+                error = (
+                    "Candidate Pool 协议错误: action_input 只能且必须包含 targets"
+                )
+                trajectory.append({"error": error})
+                if verbose:
+                    _print_observation(f"错误：{error}")
+                continue
+            try:
+                candidate_pool = CandidatePool.initialize(
+                    action_input["targets"]
+                )
+            except CandidatePoolProtocolError as exc:
+                error = f"Candidate Pool 协议错误: {exc}"
+                trajectory.append({"error": error})
+                if verbose:
+                    _print_observation(f"错误：{error}")
+                continue
+
+            observation = candidate_pool.model_snapshot()
+            trajectory.append(
+                {
+                    "thought": decision.get("thought", ""),
+                    "action": decision["action"],
+                    "input": action_input,
+                    "observation": observation,
+                }
+            )
+            if verbose:
+                _print_observation(
+                    _summarize_observation(
+                        observation,
+                        session_poems=session_poems,
+                        concise=True,
+                    )
+                )
+            continue
+
+        # 6. 校验工具
         tool = TOOLS.get(decision["action"])
         if tool is None:
             error = f"未知工具 {decision['action']}"
@@ -98,7 +158,7 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
                 _print_observation(f"错误：{error}")
             continue
 
-        # 6. 重复或持续无进展时不再执行工具,把干预作为观察交给下一轮。
+        # 7. 重复或持续无进展时不再执行工具,把干预作为观察交给下一轮。
         intervention = detect_repeated_action(
             decision["action"],
             decision["action_input"],
@@ -119,7 +179,7 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
                 _print_observation(intervention)
             continue
 
-        # 7. 执行工具,观察回填轨迹
+        # 8. 执行工具,观察回填轨迹
         signature = _action_signature(
             decision["action"], decision["action_input"]
         )
@@ -158,17 +218,20 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
         }
         trajectory.append(trajectory_step)
         if verbose:
-            if decision["action"] == "search_poems" and observation == []:
-                print("          [提示] 空结果反思")
             _print_observation(
                 _summarize_observation(
                     observation, session_poems=session_poems, concise=True
                 )
             )
 
-    # 8. 步数耗尽兜底:再给模型一次机会,仅基于现有检索轨迹作答。
+    # 9. 步数耗尽兜底:再给模型一次机会,仅基于现有检索轨迹作答。
     return force_finish(
-        user_query, llm, trajectory, session_poems, verbose=verbose
+        user_query,
+        llm,
+        trajectory,
+        session_poems,
+        candidate_pool=candidate_pool,
+        verbose=verbose,
     )
 
 
@@ -199,8 +262,6 @@ def detect_repeated_action(
 
 def _observation_made_progress(action: str, observation) -> bool:
     """判断工具结果是否带来了可供后续回答使用的新信息。"""
-    if action == "search_poems":
-        return isinstance(observation, list) and bool(observation)
     if action == "get_poem_detail":
         return isinstance(observation, dict) and "error" not in observation
     return bool(observation)
@@ -212,10 +273,20 @@ def force_finish(
     trajectory: list,
     session_poems: dict[int, str],
     *,
+    candidate_pool: CandidatePool | None = None,
     verbose: bool = False,
 ) -> dict:
-    """步数耗尽时强制作答,并沿用正常 finish 的引用可信度检查。"""
-    prompt = build_force_finish_prompt(user_query, trajectory, session_poems)
+    """步数耗尽时强制作答，并沿用正常 finish 的引用可信性检查。"""
+    prompt = build_force_finish_prompt(
+        user_query,
+        trajectory,
+        session_poems,
+        candidate_pool=(
+            candidate_pool.model_snapshot()
+            if candidate_pool is not None
+            else None
+        ),
+    )
     if verbose:
         print("          [兜底] 达到步数上限,基于已有信息作答")
         _print_final_separator()
@@ -240,7 +311,21 @@ def force_finish(
     )
     if degraded:
         result["degraded"] = True
-    return result
+    return _with_candidate_pool(result, candidate_pool)
+
+
+def _with_candidate_pool(
+    result: dict, candidate_pool: CandidatePool | None
+) -> dict:
+    """统一追加公开精简池快照；无需检索的兼容路径返回 None。"""
+    return {
+        **result,
+        "candidate_pool": (
+            candidate_pool.public_snapshot()
+            if candidate_pool is not None
+            else None
+        ),
+    }
 
 
 def _extract_force_finish_answer(raw: str) -> str:

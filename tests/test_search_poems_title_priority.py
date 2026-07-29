@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from poem_agent.agent import run_agent
 from poem_agent.agent.prompts import SYSTEM_INSTRUCTION
+from poem_agent.retrieval import retrieve_all_poems
 from poem_agent.tools import search_poems
 
 
@@ -243,18 +244,30 @@ class SearchPoemsContractTests(unittest.TestCase):
         )
         self.assertNotIn("matched_by", results[0])
 
+    def test_internal_full_retrieval_is_not_limited_by_public_top_k(self):
+        poems = [poem(f"p{i}", f"诗{i}", author="甲") for i in range(7)]
+        with patch(
+            "poem_agent.retrieval.engine.store.load_poems",
+            return_value=poems,
+        ):
+            public = search_poems(author="甲")
+            full = retrieve_all_poems(author="甲")
+
+        self.assertEqual(len(public), 5)
+        self.assertEqual(len(full), 7)
+
 
 class PromptAndAgentRegressionTests(unittest.TestCase):
-    def test_prompt_defines_structured_responsibility_and_relaxation_order(self):
-        self.assertIn(
-            "不会从 query 识别、猜取或补全作者、朝代、\n  标题",
-            SYSTEM_INSTRUCTION,
-        )
-        self.assertIn("有 title 时优先保留 title", SYSTEM_INSTRUCTION)
-        self.assertIn("移除 author 和 dynasty", SYSTEM_INSTRUCTION)
-        self.assertIn("优先保留 author,移除 dynasty", SYSTEM_INSTRUCTION)
-        self.assertIn("放宽结果只用于识别冲突", SYSTEM_INSTRUCTION)
-        self.assertIn("仍须调用\n   get_poem_detail", SYSTEM_INSTRUCTION)
+    def test_prompt_requires_one_pool_initialization_and_target_pairing(self):
+        self.assertIn("先且只能成功调用一次", SYSTEM_INSTRUCTION)
+        self.assertIn("全部 1–4 个 targets", SYSTEM_INSTRUCTION)
+        self.assertIn("不能直接调用 search_poems", SYSTEM_INSTRUCTION)
+        self.assertIn("必须拆成两个正确配对的 targets", SYSTEM_INSTRUCTION)
+        self.assertIn("theme_coverage 在阶段 1 固定为 null", SYSTEM_INSTRUCTION)
+        self.assertIn("候选 score", SYSTEM_INSTRUCTION)
+        self.assertNotIn("normal", SYSTEM_INSTRUCTION)
+        self.assertNotIn("low_conf", SYSTEM_INSTRUCTION)
+        self.assertNotIn("no_hit", SYSTEM_INSTRUCTION)
 
     def test_agent_diagnoses_wrong_author_then_corrects_from_detail(self):
         candidate = {
@@ -270,11 +283,9 @@ class PromptAndAgentRegressionTests(unittest.TestCase):
             "appreciation": [],
             "annotations": [],
         }
-        search_calls: list[dict] = []
         detail_calls: list[str] = []
 
         def fake_search(**conditions) -> list[dict]:
-            search_calls.append(conditions)
             return [] if conditions.get("author") == "李白" else [candidate]
 
         def fake_detail(poem_id: str) -> dict:
@@ -284,14 +295,18 @@ class PromptAndAgentRegressionTests(unittest.TestCase):
         llm = FakeLLM(
             [
                 decision(
-                    "先严格核对作者与标题",
-                    "search_poems",
-                    {"author": "李白", "title": "春望"},
-                ),
-                decision(
-                    "组合条件为空，保留标题诊断冲突",
-                    "search_poems",
-                    {"title": "春望"},
+                    "一次初始化并由系统诊断",
+                    "initialize_candidate_pool",
+                    {
+                        "targets": [
+                            {
+                                "author": "李白",
+                                "title": "春望",
+                                "dynasty": None,
+                                "themes": [],
+                            }
+                        ]
+                    },
                 ),
                 decision(
                     "读取详情后再纠正",
@@ -306,33 +321,26 @@ class PromptAndAgentRegressionTests(unittest.TestCase):
             ]
         )
 
-        with patch.dict(
-            "poem_agent.agent.TOOLS",
-            {
-                "search_poems": fake_search,
-                "get_poem_detail": fake_detail,
-            },
-            clear=True,
+        with (
+            patch(
+                "poem_agent.candidate_pool.retrieve_all_poems",
+                side_effect=fake_search,
+            ),
+            patch.dict(
+                "poem_agent.agent.TOOLS",
+                {"get_poem_detail": fake_detail},
+                clear=True,
+            ),
         ):
             result = run_agent("请赏析李白的《春望》", llm)
 
-        self.assertEqual(
-            search_calls,
-            [
-                {"author": "李白", "title": "春望"},
-                {"title": "春望"},
-            ],
-        )
         self.assertEqual(detail_calls, ["spring-view"])
         self.assertEqual(result["answer"], "《春望》的作者是杜甫，并非李白。")
-        self.assertIn(
-            "调用 search_poems({'author': '李白', 'title': '春望'})",
-            llm.prompts[2],
+        self.assertEqual(
+            result["candidate_pool"]["profile"]["target_results"][0]["status"],
+            "conflict",
         )
-        self.assertIn(
-            "调用 search_poems({'title': '春望'})",
-            llm.prompts[2],
-        )
+        self.assertIn('"status": "conflict"', llm.prompts[1])
 
 
 def decision(thought: str, action: str, action_input: dict) -> dict:

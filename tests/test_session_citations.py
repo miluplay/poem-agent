@@ -46,6 +46,63 @@ class FakeLLM:
 
 
 class SessionCitationTests(unittest.TestCase):
+    def test_dangling_citation_regeneration_still_uses_real_evidence(self):
+        poem = detail("poem-a", "静夜思", "真实赏析")
+        llm = FakeLLM(
+            [
+                {
+                    "thought": "初始化",
+                    "action": "initialize_candidate_pool",
+                    "action_input": {
+                        "targets": [{"title": "静夜思", "themes": []}]
+                    },
+                },
+                {
+                    "thought": "取详情",
+                    "action": "get_poem_detail",
+                    "action_input": {"poem_id": "poem-a"},
+                },
+                {
+                    "thought": "首次作答",
+                    "action": "finish",
+                    "action_input": {
+                        "answer": "这是一段带悬空引用的完整解读 [诗1-appr-99]"
+                    },
+                },
+                {
+                    "thought": "修正引用",
+                    "action": "finish",
+                    "action_input": {
+                        "answer": "这是一段已修正引用的完整解读 [诗1-appr-0]"
+                    },
+                },
+            ]
+        )
+        with (
+            patch(
+                "poem_agent.candidate_pool.retrieve_all_poems",
+                return_value=[
+                    {
+                        "poem_id": "poem-a",
+                        "title": "静夜思",
+                        "author": "李白",
+                        "dynasty": "唐",
+                        "score": None,
+                    }
+                ],
+            ),
+            patch.dict(
+                "poem_agent.agent.TOOLS",
+                {"get_poem_detail": lambda poem_id: poem},
+                clear=True,
+            ),
+        ):
+            result = run_agent("赏析静夜思", llm)
+
+        self.assertFalse(result["degraded"])
+        self.assertEqual(result["evidence"][0]["evidence_id"], "poem-a#appr-0")
+        self.assertIn("悬空引用", llm.prompts[-1])
+
     def test_single_poem_run_keeps_evidence_binding(self):
         poem = detail("poem-a", "静夜思", "单诗赏析")
         candidates = [
@@ -60,9 +117,11 @@ class SessionCitationTests(unittest.TestCase):
         llm = FakeLLM(
             [
                 {
-                    "thought": "先检索",
-                    "action": "search_poems",
-                    "action_input": {"query": "静夜思"},
+                    "thought": "先初始化候选池",
+                    "action": "initialize_candidate_pool",
+                    "action_input": {
+                        "targets": [{"title": "静夜思", "themes": []}]
+                    },
                 },
                 {
                     "thought": "取详情",
@@ -77,20 +136,23 @@ class SessionCitationTests(unittest.TestCase):
             ]
         )
 
-        with patch.dict(
-            "poem_agent.agent.TOOLS",
-            {
-                "search_poems": lambda query: candidates,
-                "get_poem_detail": lambda poem_id: poem,
-            },
-            clear=True,
+        with (
+            patch(
+                "poem_agent.candidate_pool.retrieve_all_poems",
+                return_value=candidates,
+            ),
+            patch.dict(
+                "poem_agent.agent.TOOLS",
+                {"get_poem_detail": lambda poem_id: poem},
+                clear=True,
+            ),
         ):
             result = run_agent("赏析静夜思", llm)
 
         self.assertEqual(result["evidence"][0]["evidence_id"], "poem-a#appr-0")
         self.assertEqual(result["evidence"][0]["text"], "单诗赏析")
         self.assertEqual(result["evidence"][0]["poem_number"], 1)
-        self.assertIn("《静夜思》李白 (poem_id=poem-a", llm.prompts[1])
+        self.assertIn('"visible_candidate_ids": ["poem-a"]', llm.prompts[1])
         self.assertIn("【诗1】", llm.prompts[2])
         self.assertIn("[诗1-appr-0]", llm.prompts[2])
         self.assertIn("'poem_id': 'poem-a'", llm.prompts[2])
@@ -126,14 +188,14 @@ class SessionCitationTests(unittest.TestCase):
         llm = FakeLLM(
             [
                 {
-                    "thought": "第一次检索",
-                    "action": "search_poems",
-                    "action_input": {"query": "甲诗"},
-                },
-                {
-                    "thought": "第二次检索",
-                    "action": "search_poems",
-                    "action_input": {"query": "乙诗"},
+                    "thought": "一次初始化两个目标",
+                    "action": "initialize_candidate_pool",
+                    "action_input": {
+                        "targets": [
+                            {"title": "甲诗", "themes": []},
+                            {"title": "乙诗", "themes": []},
+                        ]
+                    },
                 },
                 {
                     "thought": "取第一次结果的详情",
@@ -148,13 +210,16 @@ class SessionCitationTests(unittest.TestCase):
             ]
         )
 
-        with patch.dict(
-            "poem_agent.agent.TOOLS",
-            {
-                "search_poems": search,
-                "get_poem_detail": get_detail,
-            },
-            clear=True,
+        with (
+            patch(
+                "poem_agent.candidate_pool.retrieve_all_poems",
+                side_effect=lambda **query: search(query["title"]),
+            ),
+            patch.dict(
+                "poem_agent.agent.TOOLS",
+                {"get_poem_detail": get_detail},
+                clear=True,
+            ),
         ):
             result = run_agent("比较甲诗和乙诗", llm)
 
@@ -162,7 +227,7 @@ class SessionCitationTests(unittest.TestCase):
         self.assertEqual(result["evidence"][0]["evidence_id"], "poem-a#appr-0")
 
     def test_system_instruction_requires_real_poem_id_and_session_citation(self):
-        self.assertIn("原样复制其 poem_id", SYSTEM_INSTRUCTION)
+        self.assertIn("poem_id 必须原样复制自池快照", SYSTEM_INSTRUCTION)
         self.assertIn("[诗1-appr-0]", SYSTEM_INSTRUCTION)
         self.assertNotIn("候选N", SYSTEM_INSTRUCTION)
         self.assertNotIn("(如 [appr-0]", SYSTEM_INSTRUCTION)

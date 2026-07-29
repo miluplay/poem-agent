@@ -12,7 +12,6 @@ from .search import search_poems
 
 # 工具注册表:循环靠它查名字、调用
 TOOLS = {
-    "search_poems": search_poems,
     "get_poem_detail": get_poem_detail,
 }
 

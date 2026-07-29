@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from ..utils import short_id
 
 
@@ -39,6 +41,16 @@ def _summarize_observation(
                 f'(poem_id={item["poem_id"]}{score_text})'
             )
         return f"检索到 {len(obs)} 首候选:\n" + "\n".join(candidates)
+
+    if (
+        isinstance(obs, dict)
+        and "targets" in obs
+        and "profile" in obs
+        and "verdict" in obs
+    ):
+        return "Candidate Pool 已初始化:\n" + json.dumps(
+            obs, ensure_ascii=False, sort_keys=True
+        )
 
     # 错误情况:如 not_found,直接把错误透传给模型(触发无据不答)
     if "error" in obs:

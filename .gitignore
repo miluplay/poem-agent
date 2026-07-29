@@ -8,5 +8,6 @@ task.md
 chroma/
 CXtask.md
 test.py
-tests/
+tests/*
+!tests/test_candidate_pool.py
 /规划/
