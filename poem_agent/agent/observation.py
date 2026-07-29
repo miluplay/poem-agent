@@ -54,7 +54,16 @@ def _summarize_observation(
 
     # 错误情况:如 not_found,直接把错误透传给模型(触发无据不答)
     if "error" in obs:
-        return f'错误:{obs["error"]}(poem_id={obs.get("poem_id", "?")})'
+        legal_ids = obs.get("visible_candidate_ids")
+        legal_text = (
+            f"，当前合法 visible_candidate_ids={legal_ids}"
+            if isinstance(legal_ids, list)
+            else ""
+        )
+        return (
+            f'错误:{obs["error"]}(poem_id={obs.get("poem_id", "?")})'
+            f"{legal_text}"
+        )
 
     appr = obs.get("appreciation", [])
     anno = obs.get("annotations", [])

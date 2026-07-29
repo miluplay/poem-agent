@@ -1,6 +1,7 @@
 """诗文数据的加载与基础查询。"""
 
 import json
+import math
 from functools import lru_cache
 from pathlib import Path
 import re
@@ -58,3 +59,41 @@ def get_by_id(poem_id: str) -> dict | None:
         (poem for poem in load_poems() if poem.get("poem_id") == poem_id),
         None,
     )
+
+
+def reference_count_baseline(poems: list[dict] | None = None) -> dict:
+    """按全语料 nearest-rank 下四分位数计算两类参考量基线。"""
+    corpus = load_poems() if poems is None else poems
+    if not isinstance(corpus, list) or not corpus:
+        raise ValueError("参考量基线需要非空诗文列表")
+
+    appreciation_counts: list[int] = []
+    annotation_counts: list[int] = []
+    for index, poem in enumerate(corpus):
+        if not isinstance(poem, dict):
+            raise ValueError(f"诗文[{index}] 必须是对象")
+        appreciation = poem.get("appreciation")
+        annotations = poem.get("annotations")
+        if not isinstance(appreciation, list) or not isinstance(
+            annotations, list
+        ):
+            raise ValueError(
+                f"诗文[{index}] 的 appreciation/annotations 必须是列表"
+            )
+        if any(not isinstance(item, dict) for item in appreciation) or any(
+            not isinstance(item, dict) for item in annotations
+        ):
+            raise ValueError(
+                f"诗文[{index}] 的 appreciation/annotations 条目必须是对象"
+            )
+        appreciation_counts.append(len(appreciation))
+        annotation_counts.append(len(annotations))
+
+    rank = math.ceil(0.25 * len(corpus))
+    return {
+        "method": "corpus_lower_quartile",
+        "appreciation_threshold": sorted(appreciation_counts)[rank - 1],
+        "annotation_threshold": sorted(annotation_counts)[rank - 1],
+        "aggregate_ratio_threshold": 0.6,
+        "comparison": "strictly_greater",
+    }

@@ -41,17 +41,23 @@ initialize_candidate_pool(targets)。一次提交用户请求中的全部 1–4 
 - 最多 4 个规范化后的 targets，不得静默遗漏用户目标。
 
 initialize_candidate_pool 会在一个 Agent 步骤内完成所有主查询、必要的条件诊断、
-候选合并、target 状态、profile 和固定 verdict。初始化后的每一步都会看到精简池
+候选合并、target 状态、profile 和固定搜索 verdict。Candidate Pool 包含永久保留
+原始排序的筛选池，以及保存成功详情的详情池。初始化后的每一步都会看到精简池
 快照。阅读每个 target 的 status、retrieval、candidate_count、
-visible_candidate_ids、basis 和 theme_coverage：
+visible_candidate_ids、loaded_candidate_ids、failed_candidate_ids、
+remaining_candidate_count、basis 和 theme_coverage：
 - matched：结构化硬条件严格命中；
 - partial_match：仅取得标题部分匹配，不得冒充精确命中；
 - conflict：严格条件为空，但诊断结果证明作者或朝代冲突；
 - missing：允许的检索与诊断路径均无结果；
 - not_applicable：只有 themes，系统尚不判断主题覆盖；
 - theme_coverage 在阶段 1 固定为 null，不得宣称主题已完全满足。
+- visible_candidate_ids 是原排序中前 5 个尚未读取且未隔离的候选。只能从这里
+  选择 poem_id；详情成功后窗口会滚动补位。
+- 已加载作品只出现在 detail_pool 摘要中，不得重复调用详情。
 
 发生 conflict 时，应读取诊断候选详情，用详情里的真实作者、朝代和标题纠正用户。
+诊断详情只能说明或纠正冲突，不能把原 target 改称已满足。
 发生 missing 时应明确告知该 target 不在当前语料范围，不能用其他 target 的结果
 冒充完整满足。候选 score 只表示同一 query 下的排序信号，不是可信度等级。
 
@@ -62,6 +68,12 @@ visible_candidate_ids、basis 和 theme_coverage：
 
 需要正文或赏析时，必须先从池的可见候选中选择 poem_id，再调用
 get_poem_detail。只有候选列举且不需要详情时，允许根据池快照直接作答。
+
+## 两项客观 verdict
+`verdict` 只描述筛选结果是否符合用户 targets；`reference_verdict` 只描述
+detail_pool 已读作品的 target 覆盖和赏析/注释参考数量。两者都由系统固定计算，
+不得自行改写。参考量充足不代表观点正确或最终分析必然可信；参考量较少也不禁止
+回答，只能据实使用已经取得的证据。赏析与注释数量分别统计，正文不计入参考资料。
 
 ## finish
 资料足够时输出：
@@ -76,8 +88,14 @@ get_poem_detail。只有候选列举且不需要详情时，允许根据池快�
 纠正必须依据详情中的标题、作者、朝代，不得凭记忆。
 
 ## 必须遵守
-1. 无据不答：missing、空候选或 get_poem_detail 返回 not_found 时，说明作品不在
-   当前语料范围，不能编造。
+1. 无据不答，但必须区分两类缺失：
+   - 搜索 status=missing 或初始筛选空候选，表示当前语料中未找到符合该 target
+     的作品，应据实说明筛选未命中。
+   - not_found_after_retry、detail_access_status="unavailable" 或 reference
+     verdict 明确详情不可用，表示筛选阶段曾取得候选，但本次详情读取异常或资料
+     当前不可用；不得宣称作品本身不存在或不在语料，也不得凭记忆补全资料。
+   初次 get_poem_detail 返回 not_found 会由系统内部自动重试，不应直接当成最终
+   搜索结论。
 2. 元信息、诗歌正文原句和行文连接句不需要引用。
 3. 任何具体解读主张（意象含义、字词之妙、情感、手法、背景、意图等）必须使用
    真实的 [诗N-appr-x] 或 [诗N-note-x] 引用；一处可引多个，编号可复用。
@@ -134,7 +152,8 @@ def build_force_finish_prompt(
             candidate_pool=candidate_pool,
         )
         + "\n\n## 步数耗尽后的最终要求\n"
-        "已达到步数上限。请基于当前 Candidate Pool 和已取得的详情给出最佳回答，"
+        "已达到正常、恢复或总步数上限。请同时查看当前筛选池、详情池、搜索 "
+        "verdict、reference_stats 和 reference_verdict，并基于已取得的详情给出最佳回答，"
         "诚实说明现有信息限制，并提示用户如何追问。仍须遵守引用规则，不得编造。"
         "这一次不要再选择动作、不要输出 JSON，只输出最终回答正文。"
     )

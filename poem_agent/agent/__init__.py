@@ -28,7 +28,11 @@ from .prompts import (
 )
 
 
-MAX_STEPS = 6
+MAX_PRODUCTIVE_STEPS = 6
+MAX_RECOVERY_STEPS = 2
+MAX_TOTAL_STEPS = 8
+# 保留旧名字供既有调用方读取；循环不再依赖单一预算。
+MAX_STEPS = MAX_PRODUCTIVE_STEPS
 
 REPEATED_ACTION_OBSERVATION = (
     "你刚才已经用相同参数执行过 {action},结果没有变化。请不要重复,"
@@ -45,10 +49,15 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
     trajectory = []   # 观察轨迹:每步的 thought/action/observation
     session_poems: dict[int, str] = {}  # 会话诗序号 → poem_id
     candidate_pool: CandidatePool | None = None
-    seen_actions: set[tuple[str, str]] = set()
-    stalled_action_counts: dict[str, int] = {}
+    productive_steps = 0
+    recovery_steps = 0
+    total_steps = 0
 
-    for step in range(MAX_STEPS):
+    while (
+        productive_steps < MAX_PRODUCTIVE_STEPS
+        and recovery_steps < MAX_RECOVERY_STEPS
+        and total_steps < MAX_TOTAL_STEPS
+    ):
         # 1. 构建 prompt(系统指令 + 工具描述 + 已有观察)
         prompt = build_prompt(
             user_query,
@@ -63,20 +72,23 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
 
         # 2. LLM 决策,要求返回结构化 JSON
         decision = parse_decision(llm.generate(prompt))
+        total_steps += 1
 
         # 3. 解析失败 → 回填错误,让模型自我修正(不崩)
         if decision is None:
             error = "格式非法,请返回 JSON:{thought, action, action_input}"
             trajectory.append({"error": error})
+            recovery_steps += 1
             if verbose:
-                _print_step_error(step + 1, error)
+                _print_step_error(total_steps, error)
             continue
 
         if verbose:
-            _print_step_decision(step + 1, decision)
+            _print_step_decision(total_steps, decision)
 
         # 4. 终止:模型认为够了 → 进答案完整性与引用可信性检查
         if decision["action"] == "finish":
+            productive_steps += 1
             if verbose:
                 _print_final_separator()
             regenerate = lambda feedback="": _extract_finish_answer(
@@ -107,6 +119,7 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
                     "原池保持不变"
                 )
                 trajectory.append({"error": error})
+                recovery_steps += 1
                 if verbose:
                     _print_observation(f"错误：{error}")
                 continue
@@ -116,6 +129,7 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
                     "Candidate Pool 协议错误: action_input 只能且必须包含 targets"
                 )
                 trajectory.append({"error": error})
+                recovery_steps += 1
                 if verbose:
                     _print_observation(f"错误：{error}")
                 continue
@@ -126,11 +140,13 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
             except CandidatePoolProtocolError as exc:
                 error = f"Candidate Pool 协议错误: {exc}"
                 trajectory.append({"error": error})
+                recovery_steps += 1
                 if verbose:
                     _print_observation(f"错误：{error}")
                 continue
 
             observation = candidate_pool.model_snapshot()
+            productive_steps += 1
             trajectory.append(
                 {
                     "thought": decision.get("thought", ""),
@@ -149,66 +165,96 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
                 )
             continue
 
-        # 6. 校验工具
-        tool = TOOLS.get(decision["action"])
-        if tool is None:
+        # 6. 详情是唯一普通动作，执行前由主循环强制校验池与滚动窗口。
+        if decision["action"] != "get_poem_detail":
             error = f"未知工具 {decision['action']}"
             trajectory.append({"error": error})
+            recovery_steps += 1
             if verbose:
                 _print_observation(f"错误：{error}")
             continue
 
-        # 7. 重复或持续无进展时不再执行工具,把干预作为观察交给下一轮。
-        intervention = detect_repeated_action(
-            decision["action"],
-            decision["action_input"],
-            seen_actions,
-            stalled_action_counts,
+        action_input = decision["action_input"]
+        poem_id = action_input.get("poem_id")
+        error = None
+        legal_ids = (
+            candidate_pool.visible_candidate_ids()
+            if candidate_pool is not None
+            else []
         )
-        if intervention is not None:
+        if candidate_pool is None:
+            error = "Candidate Pool 尚未初始化，不能读取详情"
+        elif set(action_input) != {"poem_id"}:
+            error = "详情协议错误: action_input 只能且必须包含 poem_id"
+        elif not isinstance(poem_id, str) or not poem_id.strip():
+            error = "详情协议错误: poem_id 必须是非空字符串"
+        elif candidate_pool.is_loaded(poem_id):
+            error = "该作品详情已加载，请使用现有详情摘要和 trajectory"
+        elif poem_id in candidate_pool.failed_candidate_ids:
+            error = "该作品详情此前连续失败，已被隔离"
+        elif poem_id not in legal_ids:
+            error = "详情协议错误: poem_id 不属于当前可见未读窗口"
+
+        if error is not None:
+            observation = {
+                "error": error,
+                "poem_id": poem_id,
+                "visible_candidate_ids": legal_ids,
+            }
             trajectory.append(
                 {
                     "thought": decision.get("thought", ""),
                     "action": decision["action"],
-                    "input": decision["action_input"],
-                    "observation": intervention,
+                    "input": action_input,
+                    "observation": observation,
                 }
             )
+            recovery_steps += 1
             if verbose:
-                print("          [拦截] 检测到重复检索")
-                _print_observation(intervention)
+                _print_observation(
+                    f"错误：{error}；当前合法 IDs: {legal_ids}"
+                )
             continue
 
-        # 8. 执行工具,观察回填轨迹
-        signature = _action_signature(
-            decision["action"], decision["action_input"]
-        )
-        seen_actions.add(signature)
+        tool = TOOLS["get_poem_detail"]
+        automatically_retried = False
         try:
-            observation = tool(**decision["action_input"])
-        except (TypeError, ValueError) as exc:
-            stalled_action_counts[decision["action"]] = (
-                stalled_action_counts.get(decision["action"], 0) + 1
-            )
-            error = f"工具参数错误: {exc}"
-            trajectory.append({"error": error})
-            if verbose:
-                _print_observation(f"错误：{error}")
-            continue
-
-        if _observation_made_progress(decision["action"], observation):
-            stalled_action_counts[decision["action"]] = 0
-        else:
-            stalled_action_counts[decision["action"]] = (
-                stalled_action_counts.get(decision["action"], 0) + 1
-            )
+            observation = tool(poem_id=poem_id)
+        except Exception:
+            # 工具异常仅允许相同 ID 立即重试；第二次异常原样向上抛出。
+            automatically_retried = True
+            observation = tool(poem_id=poem_id)
+        if (
+            not automatically_retried
+            and isinstance(observation, dict)
+            and observation.get("error") == "not_found"
+        ):
+            observation = tool(poem_id=poem_id)
 
         if (
-            decision["action"] == "get_poem_detail"
-            and isinstance(observation, dict)
-            and "error" not in observation
+            isinstance(observation, dict)
+            and observation.get("error") == "not_found"
         ):
-            _assign_session_poem(session_poems, observation["poem_id"])
+            recovery = candidate_pool.recover_failed_detail(poem_id)
+            observation = {
+                "error": "not_found_after_retry",
+                "poem_id": poem_id,
+                "recovery": recovery,
+                "visible_candidate_ids": (
+                    candidate_pool.visible_candidate_ids()
+                ),
+            }
+            recovery_steps += 1
+        elif (
+            not isinstance(observation, dict)
+            or "error" in observation
+            or observation.get("poem_id") != poem_id
+        ):
+            # 非契约错误不伪装成 not_found 或正常进展。
+            raise RuntimeError("get_poem_detail 返回了非法结果")
+        else:
+            candidate_pool.add_detail(observation, session_poems)
+            productive_steps += 1
 
         trajectory_step = {
             "thought": decision.get("thought", ""),
@@ -224,7 +270,7 @@ def run_agent(user_query: str, llm, verbose: bool = False) -> dict:
                 )
             )
 
-    # 9. 步数耗尽兜底:再给模型一次机会,仅基于现有检索轨迹作答。
+    # 7. 任一预算耗尽后强制收尾；内部重试/重筛不占 LLM 决策轮次。
     return force_finish(
         user_query,
         llm,

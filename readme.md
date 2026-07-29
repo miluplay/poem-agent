@@ -8,8 +8,10 @@
 
 - **统一检索**：显式作者/朝代/标题硬过滤、候选池内正文/赏析双路语义检索与标签软打分。
 - **有状态 Candidate Pool**：一次提交 1–4 个 targets，批量执行初始查询与必要诊断，并在整个 Agent 运行中持续保存候选和画像。
+- **筛选池与详情池**：完整轻量候选、排序和 target 关联永久保留；成功读取的唯一作品原子进入详情池，已读或隔离候选会推动默认 5 项窗口滚动。
 - **客观搜索状态**：逐 target 计算 `matched`、`partial_match`、`conflict`、`missing` 或 `not_applicable`，由系统生成固定 verdict。
-- **多步 Agent**：手写 `thought → action → observation` 循环，不依赖 Agent 框架，最多执行 6 步。
+- **客观参考量画像**：按全语料赏析/注释数量的下四分位数（当前分别为 4/5），提供逐诗、逐 target、全池统计和独立 `reference_verdict`。
+- **多步 Agent**：手写 `thought → action → observation` 循环，不依赖 Agent 框架；正常决策最多 6 步、恢复决策最多 2 步，总决策最多 8 步。
 - **多诗任务**：作者、朝代、标题和主题的对象关系保存在同一 target，可在一次初始化中处理多首作品，再分别读取详情。
 - **可核对引用**：解读使用 `[诗N-appr-x]` 或 `[诗N-note-x]`，最终映射到完整 `evidence_id` 和原始证据文本。
 - **错误前提纠正**：用户给出的标题、作者或朝代与检索结果冲突时，基于已取回的详情纠正。
@@ -26,7 +28,8 @@
 手写 Agent 循环
    ├── initialize_candidate_pool
    │      └── 批量主查询 / 条件诊断 ──► Chroma + poems.json
-   ├── get_poem_detail ► 正文 / 注释 / 赏析
+   ├── get_poem_detail ► 可见 ID 校验 / 详情池 / 窗口滚动 / 参考画像
+   │      └── not_found 重试 / 失败隔离 / 受控 target 重筛
    └── finish
           │
           ▼
@@ -45,15 +48,15 @@
 5. 标题复用 Unicode、空白与书名号归一化：存在精确标题时排除部分命中；完全没有精确命中时才使用部分标题匹配。
 6. 不提供 `query` 时，不加载 embedding 或查询 Chroma；候选按 `poems.json` 原始顺序返回，且 `score` 为 `null`。提供 `query` 时，`score` 只表示同一 query 下的排序信号。
 7. 组合硬条件的主查询为空时，系统最多执行一个预编译诊断：有标题就只保留标题；无标题但作者与朝代并存时只保留作者。诊断结果只用于形成 `conflict` 依据。
-8. 池内部保存每个查询的完整候选并按真实 `poem_id` 全局去重，同时保留每个 target 的候选关联。Prompt 默认展示每个 target 的前 5 个轻量候选，最终 JSON 只保留这些候选的 ID；`size`、`author_dist` 和 `candidate_count` 仍按完整候选计算。
+8. 池内部保存每个查询的完整候选并按真实 `poem_id` 全局去重，同时保留每个 target 的候选关联。Prompt 默认展示每个 target 排名最靠前的 5 个未读、未隔离轻量候选；详情成功或失败隔离后自动滚动补位。`size`、`author_dist` 和 `candidate_count` 始终按完整原始候选计算。
 
 向量存储使用本地持久化的 Chroma，正文和赏析分别写入 `poem_content`、`poem_appreciation` 两个 collection。
 
 ### Candidate Pool 画像与引用
 
-阶段 1 的 profile 包含全池 `size`、`author_dist`、逐项可追溯的 `target_results` 和固定为 `null` 的 `theme_coverage`。系统根据 target 状态生成固定 verdict，类型包括全部命中、部分满足、标题部分匹配、请求不符、未命中，以及“已取得主题排序候选，但主题覆盖待评估”。
+筛选池的 profile 包含全池 `size`、`author_dist`、逐项可追溯的 `target_results` 和固定为 `null` 的 `theme_coverage`。系统根据 target 状态生成固定搜索 verdict，类型包括全部命中、部分满足、标题部分匹配、请求不符、未命中，以及“已取得主题排序候选，但主题覆盖待评估”。
 
-Agent 只有在调用 `get_poem_detail` 后才能使用作品详情。每首取回的作品会获得稳定的会话编号，例如：
+Agent 只能对当前 `visible_candidate_ids` 调用 `get_poem_detail`。成功详情以真实 `poem_id` 唯一保存，关联全部 targets 和主查询/诊断来源，并获得稳定的会话编号，例如：
 
 ```text
 [诗1-appr-0]  第一首诗的第 0 个赏析证据块
@@ -62,7 +65,9 @@ Agent 只有在调用 `get_poem_detail` 后才能使用作品详情。每首取�
 
 回答完成后，系统会把这些短引用绑定到 `poems.json` 中的完整证据 ID，并返回对应原文。非法格式会被清理；引用了未取详情的作品或不存在的段号时，系统会要求模型修正一次，仍无法修正则保留风险提示并标记 `degraded: true`。
 
-旧的逐诗检索分数等级已移除。Candidate Pool 的 target 状态只描述结构化条件和检索结果能够客观证明的满足情况；阶段 1 不计算主题覆盖率，也不判断内容分析的最终可信性。
+详情池分别统计赏析块和注释条目，正文不计数。逐诗以对应下四分位数为充足边界；target 与全池都严格使用 `sufficient_ratio > 0.6`，且池级以 targets 为同级单位汇总。`reference_verdict` 描述已读详情覆盖和参考数量，不覆盖搜索 verdict，也不代表观点正确性或最终分析可信性；参考量较少不会设置 `degraded`。
+
+合法详情 `not_found` 会对同一 ID 自动重试一次；连续失败后隔离该 ID，并对每个关联 target 至多受控重筛一次。工具异常同样只重试一次，仍异常则直接向上抛出。
 
 ## 项目结构
 
@@ -74,7 +79,7 @@ Agent 只有在调用 `get_poem_detail` 后才能使用作品详情。每首取�
 ├── scripts/
 │   └── build_index.py           # 构建正文/赏析 Chroma 索引
 ├── poem_agent/
-│   ├── candidate_pool.py            # targets、查询任务、完整候选、画像与 verdict
+│   ├── candidate_pool.py            # 筛选池、详情池、覆盖与两类客观画像
 │   ├── agent/
 │   │   ├── __init__.py          # Agent 主循环、解析、防空转与强制收尾
 │   │   ├── prompts.py           # 系统指令和 Prompt 构造
@@ -233,7 +238,32 @@ python scripts/build_index.py \
       ],
       "theme_coverage": null
     },
-    "verdict": "全部命中：所有 target 的结构化条件均得到严格匹配。"
+    "verdict": "全部命中：所有 target 的结构化条件均得到严格匹配。",
+    "detail_pool": {
+      "size": 0,
+      "items": [],
+      "available_target_coverage": {
+        "status": "none_loaded",
+        "eligible_target_ids": [1],
+        "loaded_target_ids": [],
+        "unloaded_target_ids": [1],
+        "unavailable_target_ids": [],
+        "loaded_target_ratio": 0.0
+      }
+    },
+    "reference_stats": {
+      "baseline": {
+        "method": "corpus_lower_quartile",
+        "appreciation_threshold": 4,
+        "annotation_threshold": 5,
+        "aggregate_ratio_threshold": 0.6,
+        "comparison": "strictly_greater"
+      },
+      "by_poem": [],
+      "by_target": [],
+      "overall": {}
+    },
+    "reference_verdict": "尚未读取作品详情，参考量未评估。"
   },
   "degraded": false
 }
