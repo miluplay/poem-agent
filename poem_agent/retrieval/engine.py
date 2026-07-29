@@ -1,4 +1,4 @@
-"""混合检索算法实现。"""
+"""统一诗文检索管线。"""
 
 from __future__ import annotations
 
@@ -16,31 +16,20 @@ _QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 _CONTENT_COLLECTION = "poem_content"
 _APPRECIATION_COLLECTION = "poem_appreciation"
 _SEMANTIC_TOP_N = 20
-_MIN_SUBSTRING_TITLE_LENGTH = 2
 
 
-def _build_vocabularies() -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
-    """从当前诗库动态生成作者、朝代和标签词表。"""
-    authors: set[str] = set()
-    dynasties: set[str] = set()
+def _build_tag_vocabulary() -> frozenset[str]:
+    """从当前诗库动态生成标签词表。"""
     tags: set[str] = set()
-
     for poem in store.load_poems():
-        author = poem.get("author")
-        dynasty = poem.get("dynasty")
-        if isinstance(author, str) and author:
-            authors.add(author)
-        if isinstance(dynasty, str) and dynasty:
-            dynasties.add(dynasty)
         for tag in poem.get("tags", []):
             if isinstance(tag, str) and tag:
                 tags.add(tag)
-
-    return frozenset(authors), frozenset(dynasties), frozenset(tags)
+    return frozenset(tags)
 
 
 # 词表随进程启动从 poems.json 生成；新增数据后重启即可自动纳入。
-_AUTHORS, _DYNASTIES, _TAGS = _build_vocabularies()
+_TAGS = _build_tag_vocabulary()
 
 
 @lru_cache(maxsize=1)
@@ -59,25 +48,9 @@ def _get_chroma_client() -> Any:
     return chromadb.PersistentClient(path=str(_CHROMA_PATH))
 
 
-def _extract_query_terms(
-    query: str,
-) -> tuple[set[str], set[str], set[str]]:
-    """用子串包含匹配识别查询中的作者、朝代和标签。"""
-    return (
-        {author for author in _AUTHORS if author in query},
-        {dynasty for dynasty in _DYNASTIES if dynasty in query},
-        {tag for tag in _TAGS if tag in query},
-    )
-
-
-def _passes_hard_filters(
-    poem: dict, query_authors: set[str], query_dynasties: set[str]
-) -> bool:
-    """作者和朝代一旦在查询中出现，就作为硬过滤条件。"""
-    return (
-        (not query_authors or poem.get("author") in query_authors)
-        and (not query_dynasties or poem.get("dynasty") in query_dynasties)
-    )
+def _extract_query_tags(query: str) -> set[str]:
+    """识别 query 中显式出现的标签，只作为软排序信号。"""
+    return {tag for tag in _TAGS if tag in query}
 
 
 def _calculate_tag_score(poem: dict, query_tags: set[str]) -> float:
@@ -93,21 +66,31 @@ def _fuse_score(semantic_score: float, tag_score: float) -> float:
     return 0.6 * semantic_score + 0.4 * tag_score
 
 
-def _query_collection(collection_name: str, query_embedding: list[float]) -> dict:
-    """查询单个 collection，空 collection 直接返回空结果。"""
+def _query_collection(
+    collection_name: str,
+    query_embedding: list[float],
+    candidate_ids: frozenset[str] | None,
+) -> dict:
+    """查询单个 collection，并用元数据过滤把召回限制在候选池内。"""
     collection = _get_chroma_client().get_collection(name=collection_name)
     result_count = min(_SEMANTIC_TOP_N, collection.count())
-    if result_count == 0:
+    if result_count == 0 or candidate_ids == frozenset():
         return {"metadatas": [[]], "distances": [[]]}
-    return collection.query(
-        query_embeddings=[query_embedding],
-        n_results=result_count,
-        include=["metadatas", "distances"],
-    )
+
+    query_args: dict[str, Any] = {
+        "query_embeddings": [query_embedding],
+        "n_results": result_count,
+        "include": ["metadatas", "distances"],
+    }
+    if candidate_ids is not None:
+        query_args["where"] = {"poem_id": {"$in": sorted(candidate_ids)}}
+    return collection.query(**query_args)
 
 
-def _semantic_scores(query: str) -> dict[str, float]:
-    """分别检索正文和赏析，并按 poem_id 对两路余弦相似度取最大值。"""
+def _semantic_scores(
+    query: str, candidate_ids: frozenset[str] | None = None
+) -> dict[str, float]:
+    """在候选池内检索正文和赏析，并按 poem_id 对两路相似度取最大值。"""
     model = _get_embedding_model()
     embedding = model.encode(
         [_QUERY_PREFIX + query],
@@ -119,7 +102,9 @@ def _semantic_scores(query: str) -> dict[str, float]:
 
     scores: dict[str, float] = {}
     for collection_name in (_CONTENT_COLLECTION, _APPRECIATION_COLLECTION):
-        result = _query_collection(collection_name, query_embedding)
+        result = _query_collection(
+            collection_name, query_embedding, candidate_ids
+        )
         metadatas = (result.get("metadatas") or [[]])[0]
         distances = (result.get("distances") or [[]])[0]
         for metadata, distance in zip(metadatas, distances):
@@ -132,161 +117,125 @@ def _semantic_scores(query: str) -> dict[str, float]:
     return scores
 
 
-def _is_exact_title_match(
-    normalized_title: str, normalized_query: str
-) -> bool:
-    """判断已归一化的标题与查询是否完全相等。"""
-    return bool(normalized_query) and normalized_title == normalized_query
-
-
-def _is_partial_title_match(
-    normalized_title: str, normalized_query: str
-) -> bool:
-    """判断已归一化的标题是否包含查询，但排除完全相等。"""
-    return (
-        bool(normalized_query)
-        and normalized_title != normalized_query
-        and normalized_query in normalized_title
-    )
-
-
-def _title_matches(query: str) -> tuple[list[dict], list[dict]]:
-    """查找完整检索使用的精确/部分标题命中，复用标题归一化规则。"""
-    normalized_query = store._normalize_title(query)
+def _partition_title_matches(
+    poems: list[dict], title: str
+) -> tuple[list[dict], list[dict]]:
+    """按既有标题归一规则拆分精确与部分命中。"""
+    normalized_title = store._normalize_title(title)
+    if not normalized_title:
+        return [], []
     exact_matches: list[dict] = []
     partial_matches: list[dict] = []
 
-    for poem in store.load_poems():
-        title = poem.get("title")
-        if not isinstance(title, str):
+    for poem in poems:
+        poem_title = poem.get("title")
+        if not isinstance(poem_title, str):
             continue
-        normalized_title = store._normalize_title(title)
-        if _is_exact_title_match(normalized_title, normalized_query):
+        normalized_poem_title = store._normalize_title(poem_title)
+        if normalized_poem_title == normalized_title:
             exact_matches.append(poem)
-        elif _is_partial_title_match(normalized_title, normalized_query):
+        elif normalized_title in normalized_poem_title:
             partial_matches.append(poem)
 
     return exact_matches, partial_matches
 
 
-def _is_content_title_match(
-    normalized_title: str, normalized_query: str
-) -> bool:
-    """判断标题能否作为 query 中的内容线索，单字标题一律排除。"""
-    return (
-        len(normalized_title) >= _MIN_SUBSTRING_TITLE_LENGTH
-        and normalized_title != normalized_query
-        and normalized_title in normalized_query
-    )
-
-
-def _content_title_matches(
-    query: str, query_authors: set[str]
+def _hard_filter(
+    poems: list[dict],
+    *,
+    author: str | None,
+    dynasty: str | None,
+    title: str | None,
 ) -> list[dict]:
-    """用 query 中的标题子串定位诗，并用已识别作者核对候选。"""
-    normalized_query = store._normalize_title(query)
-    matches: list[dict] = []
+    """独立确定标题匹配层级，再与作者、朝代硬条件取交集。"""
+    title_candidates = poems
+    if title is not None:
+        exact_matches, partial_matches = _partition_title_matches(poems, title)
+        # 精确标题具有排他性；只有全库完全没有精确命中时才启用部分匹配容错。
+        title_candidates = exact_matches if exact_matches else partial_matches
 
-    for poem in store.load_poems():
-        title = poem.get("title")
-        if not isinstance(title, str):
-            continue
-        normalized_title = store._normalize_title(title)
-        if _is_content_title_match(normalized_title, normalized_query):
-            matches.append(poem)
-
-    # 查询提到作者时始终核对，避免唯一标题也因作者不符而误短路。
-    if query_authors:
-        matches = [
-            poem for poem in matches if poem.get("author") in query_authors
-        ]
-    return matches
-
-
-def _title_shortcut_result(poem: dict) -> list[dict]:
-    """构造唯一标题定位时的短路返回值。"""
-    return [
-        {
-            "poem_id": poem["poem_id"],
-            "title": poem["title"],
-            "author": poem["author"],
-            "dynasty": poem["dynasty"],
-            "score": 1.0,
-            "matched_by": "title",
-        }
-    ]
-
-
-def hybrid_search(query: str, top_k: int) -> list[dict]:
-    """融合标题、正文/赏析语义和标签信号检索诗文。"""
-    exact_title_matches, partial_title_matches = _title_matches(query)
-    if len(exact_title_matches) == 1:
-        return _title_shortcut_result(exact_title_matches[0])
-
-    poems_by_id = {poem["poem_id"]: poem for poem in store.load_poems()}
-    query_authors, query_dynasties, query_tags = _extract_query_terms(query)
-    content_title_matches = _content_title_matches(query, query_authors)
-    if len(content_title_matches) == 1:
-        return _title_shortcut_result(content_title_matches[0])
-
-    exact_title_ids = {
-        poem["poem_id"] for poem in exact_title_matches
-    }
-    partial_title_ids = {
-        poem["poem_id"] for poem in partial_title_matches
-    }
-    title_ids = exact_title_ids | partial_title_ids
-    semantic_scores = _semantic_scores(query)
-
-    candidates: list[dict] = []
-    candidate_ids = title_ids | set(semantic_scores)
-    for poem_id in candidate_ids:
-        poem = poems_by_id.get(poem_id)
-        if poem is None or not _passes_hard_filters(
-            poem, query_authors, query_dynasties
-        ):
-            continue
-
-        is_exact_title_match = poem_id in exact_title_ids
-        is_partial_title_match = poem_id in partial_title_ids
-        is_title_match = is_exact_title_match or is_partial_title_match
-        semantic_score = 1.0 if is_title_match else semantic_scores[poem_id]
-        tag_score = _calculate_tag_score(poem, query_tags)
-        candidates.append(
-            {
-                "poem_id": poem_id,
-                "title": poem["title"],
-                "author": poem["author"],
-                "dynasty": poem["dynasty"],
-                "score": _fuse_score(semantic_score, tag_score),
-                "matched_by": (
-                    "title"
-                    if is_title_match
-                    else "tag"
-                    if tag_score > 0
-                    else "semantic"
-                ),
-                "_title_match_rank": (
-                    0
-                    if is_exact_title_match
-                    else 1
-                    if is_partial_title_match
-                    else 2
-                ),
-            }
+    candidates = [
+        poem
+        for poem in title_candidates
+        if (
+            author is None
+            or (
+                isinstance(poem.get("author"), str)
+                and poem["author"].strip() == author
+            )
         )
+        and (
+            dynasty is None
+            or (
+                isinstance(poem.get("dynasty"), str)
+                and poem["dynasty"].strip() == dynasty
+            )
+        )
+    ]
+    return candidates
 
-    # 精确标题、部分标题、语义结果依次置顶；层内沿用原有次级排序。
-    poem_order = {
-        poem["poem_id"]: index for index, poem in enumerate(store.load_poems())
+
+def _lightweight_result(poem: dict, score: float | None) -> dict:
+    """把库内详情裁成统一工具的轻量候选结构。"""
+    return {
+        "poem_id": poem["poem_id"],
+        "title": poem["title"],
+        "author": poem["author"],
+        "dynasty": poem["dynasty"],
+        "score": score,
     }
-    candidates.sort(
+
+
+def retrieve_poems(
+    *,
+    query: str | None = None,
+    author: str | None = None,
+    dynasty: str | None = None,
+    title: str | None = None,
+    top_k: int = 5,
+) -> list[dict]:
+    """执行硬过滤 → 候选池 → 软排序 → 截断的统一检索管线。"""
+    poems = store.load_poems()
+    candidates = _hard_filter(
+        poems, author=author, dynasty=dynasty, title=title
+    )
+    if not candidates:
+        return []
+
+    if query is None:
+        return [
+            _lightweight_result(poem, None) for poem in candidates[:top_k]
+        ]
+
+    candidate_ids = frozenset(
+        poem["poem_id"]
+        for poem in candidates
+        if isinstance(poem.get("poem_id"), str)
+    )
+    semantic_scores = _semantic_scores(
+        query,
+        None if len(candidates) == len(poems) else candidate_ids,
+    )
+    query_tags = _extract_query_tags(query)
+    poem_order = {
+        poem["poem_id"]: index for index, poem in enumerate(poems)
+    }
+
+    ranked = []
+    for poem in candidates:
+        ranked.append(
+            _lightweight_result(
+                poem,
+                _fuse_score(
+                    semantic_scores.get(poem["poem_id"], 0.0),
+                    _calculate_tag_score(poem, query_tags),
+                ),
+            )
+        )
+    ranked.sort(
         key=lambda item: (
-            item["_title_match_rank"],
             -item["score"],
             poem_order[item["poem_id"]],
         )
     )
-    for item in candidates:
-        del item["_title_match_rank"]
-    return candidates[:top_k]
+    return ranked[:top_k]

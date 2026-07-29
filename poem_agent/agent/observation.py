@@ -6,9 +6,9 @@ from ..utils import short_id
 
 
 EMPTY_SEARCH_OBSERVATION = (
-    "检索到 0 首。可能原因:①名称或字词有误(如作者名、诗名写错);"
-    "②该作品不在语料库中。请考虑修正查询,或直接告知用户不在范围,"
-    "不要用相同查询重复检索。"
+    "检索到 0 首。可能是硬条件彼此冲突或作品不在语料库中。若这是首次组合"
+    "硬条件空结果,可按系统指令进行一次参数不同的诊断性放宽检索；否则应"
+    "告知用户不在范围。不要用相同参数重复检索。"
 )
 
 
@@ -28,9 +28,15 @@ def _summarize_observation(
             return EMPTY_SEARCH_OBSERVATION
         candidates = []
         for item in obs:
+            score = item.get("score")
+            score_text = (
+                f", score={score:.2f}"
+                if isinstance(score, (int, float)) and not isinstance(score, bool)
+                else ""
+            )
             candidates.append(
                 f'《{item["title"]}》{item["author"]} '
-                f'(poem_id={item["poem_id"]}, score={item["score"]:.2f})'
+                f'(poem_id={item["poem_id"]}{score_text})'
             )
         return f"检索到 {len(obs)} 首候选:\n" + "\n".join(candidates)
 
