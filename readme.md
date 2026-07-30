@@ -4,6 +4,10 @@
 
 它不是让大模型直接凭记忆赏析诗词，而是先把用户请求解析成保留对象关系的 targets，在一个 Agent 步骤内初始化 Candidate Pool，再读取正文、注释与赏析并基于真实证据回答。回答中的解读引用可以绑定回具体语料块；遇到库外作品、错误前提或无效引用时，系统会标明缺失、诊断冲突、重试或诚实拒答。
 
+## 版本状态
+
+当前版本为 **v0.6**。Candidate Pool 的三个阶段已经完成：批量 targets 与搜索画像、筛选池与详情池及参考量画像、任务相关分析支撑与统一终检。完整测试共 82 项，当前全部通过。
+
 ## 已实现能力
 
 - **统一检索**：显式作者/朝代/标题硬过滤、候选池内正文/赏析双路语义检索与标签软打分。
@@ -69,11 +73,22 @@ Agent 只能对当前 `visible_candidate_ids` 调用 `get_poem_detail`。成功�
 
 详情池分别统计赏析块和注释条目，正文不计数。逐诗以对应下四分位数为充足边界；target 与全池都严格使用 `sufficient_ratio > 0.6`，且池级以 targets 为同级单位汇总。`reference_verdict` 描述已读详情覆盖和参考数量，不覆盖搜索 verdict，也不代表观点正确性或最终分析可信性；参考量较少不会设置 `degraded`。
 
+当前基线为赏析 4 个块、注释 5 条。两个阈值分别来自各自语料分布，表示“在同类资料中是否偏少”，不能横向比较，也不是赏析与注释的权重或可信度分数。赏析和注释会分别统计、分别披露；是否足以支持用户要求的具体分析，仍由最终 evidence、target 覆盖和 `analysis_support` 判断。
+
 合法详情 `not_found` 会对同一 ID 自动重试一次；连续失败后隔离该 ID，并对每个关联 target 至多受控重筛一次。工具异常同样只重试一次，仍异常则直接向上抛出。
 
 正常 `finish` 的 `action_input` 只允许 `answer` 和 `analysis_assessment`；后者只允许 `level` 与 `target_ids`。等级固定为 `not_applicable`、`sufficient`、`partial`、`insufficient`。系统不相信模型提交作品 ID，而是从最终非悬空 evidence 的真实 `poem_id` 反查详情池及 target 关联。`matched` 且有详情和合法依据可达到 sufficient；`partial_match`、`conflict`、未覆盖或详情不可用会限制上限；完全没有合法分析依据时为 insufficient。仅主题 target 不会因搜索层的 `not_applicable` 自动失去支撑资格。
 
 参考量 `limited` 是透明披露的软因素，不会单独机械下调 sufficient。模型可以主动申报更保守的等级，系统只会下调过度申报、不会主动上调。partial/insufficient 的固定分析支撑说明会确定性出现在回答中。分析支撑不足本身不设置 `degraded`；该布尔值仍只表示答案完整性或引用安全降级。
+
+四类结论保持独立：
+
+| 结论 | 表达的事实 |
+| --- | --- |
+| `candidate_pool.verdict` | 筛选结果是否满足用户提交的 targets |
+| `candidate_pool.reference_verdict` | 已读详情覆盖和赏析/注释参考数量 |
+| 顶层 `analysis_support` | 最终合法依据对具体分析任务的支撑范围 |
+| 顶层 `degraded` | 答案完整性或引用安全机制是否降级 |
 
 ## 项目结构
 
@@ -202,16 +217,8 @@ python scripts/build_index.py \
 
 ```json
 {
-  "answer": "基于语料生成并带有 [诗1-appr-0] 引用的回答",
-  "evidence": [
-    {
-      "evidence_id": "作品ID#appr-0",
-      "text": "对应的原始赏析文本",
-      "poem_id": "作品ID",
-      "title": "作品标题",
-      "poem_number": 1
-    }
-  ],
+  "answer": "《静夜思》的作者是李白。",
+  "evidence": [],
   "candidate_pool": {
     "targets": [
       {
@@ -273,9 +280,9 @@ python scripts/build_index.py \
     "reference_verdict": "尚未读取作品详情，参考量未评估。"
   },
   "analysis_support": {
-    "level": "sufficient",
-    "target_ids": [1],
-    "verdict": "现有详情与合法依据覆盖本次分析范围。"
+    "level": "not_applicable",
+    "target_ids": [],
+    "verdict": "本次请求不涉及内容分析。"
   },
   "degraded": false
 }

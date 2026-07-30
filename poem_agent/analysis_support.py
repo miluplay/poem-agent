@@ -1,7 +1,7 @@
 """最终回答的任务相关分析支撑计算。
 
 本模块只读取 Candidate Pool 和已经完成绑定的 evidence。它不判断文学观点
-真假，也不修改搜索、详情池或参考量画像。
+真假，也不修改搜索、详情池或参考量1画像。
 """
 
 from __future__ import annotations
