@@ -31,6 +31,15 @@ INSUFFICIENT_VERDICT = (
     "当前没有足够的可用详情与合法依据支持所要求的主体分析。"
 )
 FORCE_FALLBACK_VERDICT = "步数耗尽，未能形成可验证的分析支撑评估。"
+_KNOWN_SUPPORT_VERDICTS = (
+    NOT_APPLICABLE_VERDICT,
+    SUFFICIENT_VERDICT,
+    SUFFICIENT_LIMITED_VERDICT,
+    PARTIAL_VERDICT,
+    INSUFFICIENT_VERDICT,
+    FORCE_FALLBACK_VERDICT,
+)
+_SUPPORT_NOTICE_PREFIX = "分析支撑说明："
 
 
 class AnalysisAssessmentProtocolError(ValueError):
@@ -221,14 +230,35 @@ def force_fallback_analysis_support() -> dict:
 
 
 def append_required_support_notice(answer: str, analysis_support: dict) -> str:
-    """为 partial/insufficient 提供确定、可见且不重复的系统说明。"""
+    """清理模型复写，再由系统唯一追加当前 canonical 说明。"""
+    answer = normalize_model_support_notices(answer)
     if analysis_support["level"] not in {"partial", "insufficient"}:
         return answer
     line = f"分析支撑说明：{analysis_support['verdict']}"
     stripped = answer.rstrip()
-    if line in stripped.splitlines():
-        return stripped
     return f"{stripped}{chr(10) if stripped else ''}{line}"
+
+
+def normalize_model_support_notices(answer: str) -> str:
+    """去除模型生成的说明前缀/verdict，并保留同一行的普通解释。"""
+    if not isinstance(answer, str):
+        raise TypeError("answer 必须是字符串")
+    normalized_lines: list[str] = []
+    seen: set[str] = set()
+    for line in answer.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_SUPPORT_NOTICE_PREFIX):
+            remainder = stripped.removeprefix(_SUPPORT_NOTICE_PREFIX).strip()
+            for verdict in sorted(_KNOWN_SUPPORT_VERDICTS, key=len, reverse=True):
+                if remainder.startswith(verdict):
+                    remainder = remainder[len(verdict):].strip()
+                    break
+            stripped = remainder
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        normalized_lines.append(stripped)
+    return "\n".join(normalized_lines)
 
 
 def required_support_notice(analysis_support: dict) -> str | None:

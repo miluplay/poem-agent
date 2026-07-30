@@ -8,12 +8,18 @@ from statistics import mean, median
 from typing import Callable
 
 from . import store
+from .request import (
+    ConsolidatedRequest,
+    ResolvedRequest,
+    normalize_target_fields,
+    resolve_consolidated_request,
+)
 from .retrieval import retrieve_all_poems
 
 
 THEME_SEPARATOR = "；"
 VISIBLE_CANDIDATE_LIMIT = 5
-_TARGET_FIELDS = frozenset({"author", "dynasty", "title", "themes"})
+FROZEN_TARGET_LIMIT = 4
 
 
 class CandidatePoolProtocolError(ValueError):
@@ -52,6 +58,12 @@ class QueryTask:
 SearchFunction = Callable[..., list[dict]]
 
 
+def _target_identity(
+    target: Target,
+) -> tuple[str | None, str | None, str | None, tuple[str, ...]]:
+    return target.author, target.dynasty, target.title, target.themes
+
+
 class CandidatePool:
     """保存筛选池、详情池、搜索画像和参考量画像。"""
 
@@ -63,7 +75,10 @@ class CandidatePool:
         visible_limit: int = VISIBLE_CANDIDATE_LIMIT,
         baseline: dict | None = None,
     ) -> None:
-        self.targets = tuple(targets)
+        self._targets_by_id = {target.target_id: target for target in targets}
+        self._active_target_ids = [target.target_id for target in targets]
+        self._frozen_target_ids: list[int] = []
+        self._next_target_id = max(self._targets_by_id, default=0) + 1
         self.visible_limit = visible_limit
         self._search_fn = search_fn or retrieve_all_poems
         self.main_tasks: dict[int, QueryTask] = {}
@@ -87,6 +102,21 @@ class CandidatePool:
         self._execute()
         self._refresh()
 
+    @property
+    def targets(self) -> tuple[Target, ...]:
+        """兼容既有消费者的 active-only target 视图。"""
+        return tuple(
+            self._targets_by_id[target_id]
+            for target_id in self._active_target_ids
+        )
+
+    @property
+    def frozen_targets(self) -> tuple[Target, ...]:
+        return tuple(
+            self._targets_by_id[target_id]
+            for target_id in self._frozen_target_ids
+        )
+
     @classmethod
     def initialize(
         cls,
@@ -102,6 +132,195 @@ class CandidatePool:
             visible_limit=visible_limit,
             baseline=baseline,
         )
+
+    @classmethod
+    def initialize_request(
+        cls,
+        request: ConsolidatedRequest,
+        *,
+        search_fn: SearchFunction | None = None,
+        visible_limit: int = VISIBLE_CANDIDATE_LIMIT,
+        baseline: dict | None = None,
+    ) -> tuple["CandidatePool", ResolvedRequest]:
+        """从严格总请求初始化池，并同时返回不含临时 refs 的请求。"""
+        if not isinstance(request, ConsolidatedRequest):
+            raise TypeError("request 必须是 ConsolidatedRequest")
+        targets = [
+            Target(
+                index,
+                target.author,
+                target.dynasty,
+                target.title,
+                target.themes,
+            )
+            for index, target in enumerate(request.targets, start=1)
+        ]
+        pool = cls(
+            targets,
+            search_fn=search_fn,
+            visible_limit=visible_limit,
+            baseline=baseline,
+        )
+        target_ids_by_ref = {
+            request_target.target_ref: target.target_id
+            for request_target, target in zip(request.targets, targets)
+        }
+        return pool, resolve_consolidated_request(request, target_ids_by_ref)
+
+    def update_request(self, request: ConsolidatedRequest) -> ResolvedRequest:
+        """按最新完整请求原子更新 active/frozen targets。"""
+        if not isinstance(request, ConsolidatedRequest):
+            raise TypeError("request 必须是 ConsolidatedRequest")
+
+        identity_to_id = {
+            _target_identity(target): target_id
+            for target_id, target in self._targets_by_id.items()
+        }
+        desired_ids: list[int] = []
+        target_ids_by_ref: dict[str, int] = {}
+        new_targets: list[Target] = []
+        next_target_id = self._next_target_id
+        for request_target in request.targets:
+            identity = (
+                request_target.author,
+                request_target.dynasty,
+                request_target.title,
+                request_target.themes,
+            )
+            target_id = identity_to_id.get(identity)
+            if target_id is None:
+                target_id = next_target_id
+                next_target_id += 1
+                target = Target(target_id, *identity)
+                new_targets.append(target)
+                identity_to_id[identity] = target_id
+            desired_ids.append(target_id)
+            target_ids_by_ref[request_target.target_ref] = target_id
+
+        # 新 target 的全部检索先进入局部暂存区；任何异常都不会碰池状态或 ID。
+        staged = [self._stage_target(target) for target in new_targets]
+        resolved = resolve_consolidated_request(request, target_ids_by_ref)
+
+        old_active = list(self._active_target_ids)
+        frozen_ids = [
+            target_id
+            for target_id in self._frozen_target_ids
+            if target_id not in desired_ids
+        ]
+        frozen_ids.extend(
+            target_id
+            for target_id in old_active
+            if target_id not in desired_ids
+        )
+        evicted_ids = frozen_ids[:-FROZEN_TARGET_LIMIT]
+        frozen_ids = frozen_ids[-FROZEN_TARGET_LIMIT:]
+
+        rollback = self._mutable_state_snapshot()
+        try:
+            for target, main_task, diagnostic_task, results in staged:
+                target_id = target.target_id
+                self._targets_by_id[target_id] = target
+                self.main_tasks[target_id] = main_task
+                if diagnostic_task is not None:
+                    self.diagnostic_tasks[target_id] = diagnostic_task
+                self.target_candidate_ids[target_id] = []
+                for items, source_kind in results:
+                    for item in items:
+                        self.candidates.setdefault(item["poem_id"], dict(item))
+                    self._associate(target_id, items, source_kind)
+            self._active_target_ids = desired_ids
+            self._frozen_target_ids = frozen_ids
+            self._next_target_id = next_target_id
+            for target_id in evicted_ids:
+                self._evict_target(target_id)
+            self._refresh()
+        except Exception:
+            self._restore_mutable_state(rollback)
+            raise
+        return resolved
+
+    def _stage_target(
+        self, target: Target
+    ) -> tuple[
+        Target,
+        QueryTask,
+        QueryTask | None,
+        list[tuple[list[dict], str]],
+    ]:
+        main_task = QueryTask(target.target_id, "main", _main_query(target))
+        main_results = self._run_staged_task(main_task)
+        diagnostic_task = None
+        diagnostic_results: list[dict] = []
+        diagnostic_query = _diagnostic_query(target)
+        if diagnostic_query is not None:
+            diagnostic_task = QueryTask(
+                target.target_id, "diagnostic", diagnostic_query
+            )
+            if main_results:
+                diagnostic_task.status = "skipped"
+            else:
+                diagnostic_results = self._run_staged_task(diagnostic_task)
+        return (
+            target,
+            main_task,
+            diagnostic_task,
+            [(main_results, "main"), (diagnostic_results, "diagnostic")],
+        )
+
+    def _run_staged_task(self, task: QueryTask) -> list[dict]:
+        task.attempt_count += 1
+        try:
+            results = self._search_fn(**task.query)
+            task.candidate_ids = [item["poem_id"] for item in results]
+        except Exception:
+            task.status = "failed"
+            raise
+        task.status = "completed"
+        return results
+
+    def _mutable_state_snapshot(self) -> dict:
+        names = (
+            "_targets_by_id",
+            "_active_target_ids",
+            "_frozen_target_ids",
+            "_next_target_id",
+            "main_tasks",
+            "diagnostic_tasks",
+            "candidates",
+            "target_candidate_ids",
+            "candidate_sources",
+            "loaded_details",
+            "failed_candidate_ids",
+            "detail_unavailable_target_ids",
+            "_recovered_target_ids",
+            "target_results",
+            "profile",
+            "verdict",
+            "reference_stats",
+            "reference_verdict",
+        )
+        return {name: deepcopy(getattr(self, name)) for name in names}
+
+    def _restore_mutable_state(self, snapshot: dict) -> None:
+        for name, value in snapshot.items():
+            setattr(self, name, value)
+
+    def _evict_target(self, target_id: int) -> None:
+        self._targets_by_id.pop(target_id, None)
+        self.main_tasks.pop(target_id, None)
+        self.diagnostic_tasks.pop(target_id, None)
+        candidate_ids = self.target_candidate_ids.pop(target_id, [])
+        self.detail_unavailable_target_ids.discard(target_id)
+        self._recovered_target_ids.discard(target_id)
+        for poem_id in candidate_ids:
+            sources = self.candidate_sources.get(poem_id)
+            if sources is not None:
+                sources.pop(target_id, None)
+                if not sources:
+                    self.candidate_sources.pop(poem_id, None)
+                    if poem_id not in self.loaded_details:
+                        self.candidates.pop(poem_id, None)
+                        self.failed_candidate_ids.discard(poem_id)
 
     def _compile_tasks(self) -> None:
         for target in self.targets:
@@ -167,12 +386,13 @@ class CandidatePool:
             self._target_result(target) for target in self.targets
         ]
         author_dist: dict[str, int] = {}
-        for candidate in self.candidates.values():
+        for poem_id in self._active_candidate_ids():
+            candidate = self.candidates[poem_id]
             author = candidate.get("author")
             if isinstance(author, str):
                 author_dist[author] = author_dist.get(author, 0) + 1
         self.profile = {
-            "size": len(self.candidates),
+            "size": len(self._active_candidate_ids()),
             "author_dist": author_dist,
             "target_results": self.target_results,
             "theme_coverage": None,
@@ -182,8 +402,19 @@ class CandidatePool:
         self.reference_verdict = _build_reference_verdict(
             self.available_target_coverage(),
             self.reference_stats["overall"],
-            bool(self.detail_unavailable_target_ids),
+            bool(
+                self.detail_unavailable_target_ids
+                & set(self._active_target_ids)
+            ),
         )
+
+    def _active_candidate_ids(self) -> list[str]:
+        poem_ids: list[str] = []
+        for target_id in self._active_target_ids:
+            for poem_id in self.target_candidate_ids.get(target_id, []):
+                if poem_id not in poem_ids:
+                    poem_ids.append(poem_id)
+        return poem_ids
 
     def _target_result(self, target: Target) -> dict:
         target_id = target.target_id
@@ -239,7 +470,12 @@ class CandidatePool:
         return visible
 
     def target_ids_for(self, poem_id: str) -> list[int]:
-        return sorted(self.candidate_sources.get(poem_id, {}))
+        sources = self.candidate_sources.get(poem_id, {})
+        return [
+            target_id
+            for target_id in self._active_target_ids
+            if target_id in sources
+        ]
 
     def is_loaded(self, poem_id: str) -> bool:
         return poem_id in self.loaded_details
@@ -258,19 +494,9 @@ class CandidatePool:
         if poem_id not in self.visible_candidate_ids():
             raise CandidatePoolProtocolError("poem_id 不在当前可见未读窗口")
 
-        target_ids = self.target_ids_for(poem_id)
-        source_kinds = sorted(
-            {
-                kind
-                for kinds in self.candidate_sources[poem_id].values()
-                for kind in kinds
-            },
-            key=("main", "diagnostic").index,
-        )
         item = {
             **copied,
-            "target_ids": target_ids,
-            "source_kinds": source_kinds,
+            "_loaded_target_ids": self.target_ids_for(poem_id),
         }
         poem_number = next(
             (
@@ -288,9 +514,17 @@ class CandidatePool:
 
     def recover_failed_detail(self, poem_id: str) -> dict:
         """隔离失败候选，并对其关联 target 各执行至多一次受控重筛。"""
+        active_target_ids = self.target_ids_for(poem_id)
+        if not active_target_ids or (
+            poem_id not in self.visible_candidate_ids()
+            and poem_id not in self.failed_candidate_ids
+        ):
+            raise CandidatePoolProtocolError(
+                "poem_id 不属于当前 active target 的可恢复候选"
+            )
         self.failed_candidate_ids.add(poem_id)
         recovered: list[int] = []
-        for target_id in self.target_ids_for(poem_id):
+        for target_id in active_target_ids:
             if target_id in self._recovered_target_ids:
                 continue
             self._recovered_target_ids.add(target_id)
@@ -308,8 +542,11 @@ class CandidatePool:
             self._associate(target_id, results, task.kind)
 
         self._refresh()
-        for target_id in self.target_ids_for(poem_id):
-            result = self.target_results[target_id - 1]
+        results_by_id = {
+            result["target_id"]: result for result in self.target_results
+        }
+        for target_id in active_target_ids:
+            result = results_by_id[target_id]
             if (
                 result["loaded_candidate_count"] == 0
                 and not result["visible_candidate_ids"]
@@ -367,12 +604,15 @@ class CandidatePool:
     def _build_reference_stats(self) -> dict:
         by_poem = []
         for item in self.loaded_details.values():
+            target_ids = self.target_ids_for(item["poem_id"])
+            if not target_ids:
+                continue
             appr_count = len(item["appreciation"])
             anno_count = len(item["annotations"])
             by_poem.append(
                 {
                     "poem_id": item["poem_id"],
-                    "target_ids": list(item["target_ids"]),
+                    "target_ids": target_ids,
                     "appreciation": _poem_dimension(
                         appr_count,
                         self.reference_baseline[
@@ -425,6 +665,7 @@ class CandidatePool:
 
     def model_snapshot(self) -> dict:
         snapshot = self.public_snapshot()
+        snapshot.pop("frozen_targets", None)
         for result in snapshot["profile"]["target_results"]:
             result["visible_candidates"] = [
                 deepcopy(self.candidates[poem_id])
@@ -433,8 +674,35 @@ class CandidatePool:
         return snapshot
 
     def public_snapshot(self) -> dict:
+        detail_items = []
+        for item in self.loaded_details.values():
+            target_ids = self.target_ids_for(item["poem_id"])
+            if not target_ids:
+                continue
+            source_kinds = sorted(
+                {
+                    kind
+                    for target_id in target_ids
+                    for kind in self.candidate_sources[item["poem_id"]][target_id]
+                },
+                key=("main", "diagnostic").index,
+            )
+            detail_items.append(
+                {
+                    "poem_id": item["poem_id"],
+                    "title": item["title"],
+                    "author": item["author"],
+                    "dynasty": item["dynasty"],
+                    "target_ids": target_ids,
+                    "source_kinds": source_kinds,
+                }
+            )
         return {
             "targets": [target.snapshot() for target in self.targets],
+            "frozen_targets": [
+                {**target.snapshot(), "state": "frozen"}
+                for target in self.frozen_targets
+            ],
             "profile": {
                 "size": self.profile["size"],
                 "author_dist": dict(self.profile["author_dist"]),
@@ -443,21 +711,8 @@ class CandidatePool:
             },
             "verdict": self.verdict,
             "detail_pool": {
-                "size": len(self.loaded_details),
-                "items": [
-                    {
-                        key: deepcopy(item[key])
-                        for key in (
-                            "poem_id",
-                            "title",
-                            "author",
-                            "dynasty",
-                            "target_ids",
-                            "source_kinds",
-                        )
-                    }
-                    for item in self.loaded_details.values()
-                ],
+                "size": len(detail_items),
+                "items": detail_items,
                 "available_target_coverage": (
                     self.available_target_coverage()
                 ),
@@ -601,23 +856,13 @@ def normalize_targets(raw_targets) -> list[Target]:
     normalized = []
     seen: set[tuple] = set()
     for index, raw in enumerate(raw_targets, start=1):
-        if not isinstance(raw, dict):
-            raise CandidatePoolProtocolError(f"targets[{index}] 必须是对象")
-        unknown = set(raw) - _TARGET_FIELDS
-        if unknown:
-            raise CandidatePoolProtocolError(
-                f"targets[{index}] 包含未知字段: {'、'.join(sorted(unknown))}"
-            )
-        author = _optional_string(f"targets[{index}].author", raw.get("author"))
-        dynasty = _optional_string(f"targets[{index}].dynasty", raw.get("dynasty"))
-        raw_title = _optional_string(f"targets[{index}].title", raw.get("title"))
-        title = (store._normalize_title(raw_title) or None) if raw_title else None
-        themes = _normalize_themes(raw.get("themes", []), target_index=index)
-        if author is None and dynasty is None and title is None and not themes:
-            raise CandidatePoolProtocolError(
-                f"targets[{index}] 至少需要 author、dynasty、title 或一个 theme"
-            )
-        value = (author, dynasty, title, themes)
+        fields = normalize_target_fields(
+            raw,
+            location=f"targets[{index}]",
+            error_factory=CandidatePoolProtocolError,
+            require_all_fields=False,
+        )
+        value = fields.identity()
         if value not in seen:
             seen.add(value)
             normalized.append(value)
@@ -629,32 +874,6 @@ def normalize_targets(raw_targets) -> list[Target]:
         Target(index, *values)
         for index, values in enumerate(normalized, start=1)
     ]
-
-
-def _optional_string(name: str, value) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise CandidatePoolProtocolError(f"{name} 必须是字符串或 None")
-    return value.strip() or None
-
-
-def _normalize_themes(raw_themes, *, target_index: int) -> tuple[str, ...]:
-    if not isinstance(raw_themes, list):
-        raise CandidatePoolProtocolError(
-            f"targets[{target_index}].themes 必须是字符串列表"
-        )
-    themes: list[str] = []
-    for theme_index, theme in enumerate(raw_themes, start=1):
-        if not isinstance(theme, str) or not theme.strip():
-            raise CandidatePoolProtocolError(
-                f"targets[{target_index}].themes[{theme_index}] 必须是非空字符串"
-            )
-        normalized = theme.strip()
-        if normalized not in themes:
-            themes.append(normalized)
-    return tuple(themes)
-
 
 def _main_query(target: Target) -> dict:
     return {

@@ -46,10 +46,31 @@ def detail(poem_id, *, appr=4, anno=5, author="甲", title=None):
     }
 
 
-def init(targets):
+def init(targets, *, task_type="search"):
+    normalized = [
+        {
+            "target_ref": f"t{index}",
+            "author": target.get("author"),
+            "dynasty": target.get("dynasty"),
+            "title": target.get("title"),
+            "themes": target.get("themes", []),
+        }
+        for index, target in enumerate(targets, start=1)
+    ]
     return {
         "action": "initialize_candidate_pool",
-        "action_input": {"targets": targets},
+        "action_input": {
+            "targets": normalized,
+            "tasks": [{
+                "type": task_type,
+                "target_refs": [item["target_ref"] for item in normalized],
+                **(
+                    {"aspects": [], "custom_aspects": []}
+                    if task_type in {"appreciate", "compare"}
+                    else {}
+                ),
+            }],
+        },
     }
 
 
@@ -284,7 +305,10 @@ class DetailPoolAgentTests(unittest.TestCase):
 
         llm = FakeLLM(
             [
-                init([{"author": "甲"}, {"author": "乙"}]),
+                init(
+                    [{"author": "甲"}, {"author": "乙"}],
+                    task_type="compare",
+                ),
                 get("good"),
                 get("bad"),
                 finish("已取得一首详情，另一首资料当前不可用。"),
@@ -526,28 +550,22 @@ class DetailPoolAgentTests(unittest.TestCase):
         ):
             result = run_agent("读取五首诗", llm)
 
-        # 前六次是 Agent 动作；第七次直接使用强制收尾 Prompt，不再请求动作。
+        # 一个 active target 每轮最多成功读取两首；超额两次后强制收尾。
         self.assertEqual(len(llm.prompts), 7)
         self.assertIn("步数耗尽后的最终要求", llm.prompts[-1])
-        self.assertEqual(tool.call_count, 5)
+        self.assertEqual(tool.call_count, 2)
         self.assertEqual(result["answer"], forced_answer)
-        self.assertEqual(result["candidate_pool"]["detail_pool"]["size"], 5)
+        self.assertEqual(result["candidate_pool"]["detail_pool"]["size"], 2)
 
     def test_total_step_guard_has_no_off_by_one(self):
         unknown = {"action": "unknown", "action_input": {}}
-        forced_answer = "八轮动作硬上限后的强制收尾回答。"
-        llm = FakeLLM([*[unknown for _ in range(8)], forced(forced_answer)])
+        forced_answer = "两次恢复额度耗尽后的强制收尾回答。"
+        llm = FakeLLM([unknown, unknown, forced(forced_answer)])
+        result = run_agent("测试总硬上限", llm)
 
-        # 单独放宽两个较小熔断，只隔离验证总轮次 guard 本身。
-        with (
-            patch.object(agent_module, "MAX_PRODUCTIVE_STEPS", 99),
-            patch.object(agent_module, "MAX_RECOVERY_STEPS", 99),
-        ):
-            result = run_agent("测试总硬上限", llm)
-
-        self.assertEqual(len(llm.prompts), 9)
-        self.assertNotIn("步数耗尽后的最终要求", llm.prompts[7])
-        self.assertIn("步数耗尽后的最终要求", llm.prompts[8])
+        self.assertEqual(len(llm.prompts), 3)
+        self.assertNotIn("步数耗尽后的最终要求", llm.prompts[1])
+        self.assertIn("步数耗尽后的最终要求", llm.prompts[2])
         self.assertEqual(result["answer"], forced_answer)
 
 

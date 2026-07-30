@@ -16,6 +16,7 @@ from pathlib import Path
 import requests
 
 from poem_agent.agent import run_agent
+from poem_agent.session import AgentSession
 
 
 class LLMError(RuntimeError):
@@ -117,13 +118,19 @@ def print_result(result: dict, *, as_json: bool = False) -> None:
 
 
 def ask(
-    query: str, llm: DeepSeekLLM, *, as_json: bool, verbose: bool = False
-) -> None:
+    query: str,
+    llm: DeepSeekLLM,
+    *,
+    as_json: bool,
+    verbose: bool = False,
+    session: AgentSession | None = None,
+) -> dict | None:
     query = query.strip()
     if not query:
-        return
-    result = run_agent(query, llm, verbose=verbose)
+        return None
+    result = run_agent(query, llm, verbose=verbose, session=session)
     print_result(result, as_json=as_json)
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,18 +159,30 @@ def main() -> int:
             ask(" ".join(args.query), llm, as_json=args.json, verbose=args.verbose)
             return 0
 
-        print("poem-agent 已启动。输入问题开始，输入 exit / quit / 退出 结束。")
+        session = AgentSession()
+        print(
+            "poem-agent 多轮会话已启动（仅保留在当前进程内，退出后清空）。"
+            "输入问题开始，输入 exit / quit / 退出 结束。"
+        )
         while True:
             try:
                 query = input("\n你：").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n再见。")
                 return 0
+            if not query:
+                continue
             if query.lower() in {"exit", "quit"} or query == "退出":
                 print("再见。")
                 return 0
             try:
-                ask(query, llm, as_json=args.json, verbose=args.verbose)
+                ask(
+                    query,
+                    llm,
+                    as_json=args.json,
+                    verbose=args.verbose,
+                    session=session,
+                )
             except LLMError as exc:
                 print(f"\n错误：{exc}", file=sys.stderr)
     except LLMError as exc:

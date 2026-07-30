@@ -51,6 +51,13 @@ def _summarize_observation(
         return "Candidate Pool 已初始化:\n" + json.dumps(
             obs, ensure_ascii=False, sort_keys=True
         )
+    if (
+        isinstance(obs, dict)
+        and set(obs) == {"resolved_request", "candidate_pool"}
+    ):
+        return "完整请求与 Candidate Pool 已提交:\n" + json.dumps(
+            obs, ensure_ascii=False, sort_keys=True
+        )
 
     # 错误情况:如 not_found,直接把错误透传给模型(触发无据不答)
     if "error" in obs:
@@ -60,9 +67,15 @@ def _summarize_observation(
             if isinstance(legal_ids, list)
             else ""
         )
+        cached_ids = obs.get("activatable_cached_poem_ids")
+        cached_text = (
+            f"，可显式激活的缓存 poem IDs={cached_ids}（缓存命中不要求 visible）"
+            if isinstance(cached_ids, list)
+            else ""
+        )
         return (
             f'错误:{obs["error"]}(poem_id={obs.get("poem_id", "?")})'
-            f"{legal_text}"
+            f"{legal_text}{cached_text}"
         )
 
     appr = obs.get("appreciation", [])

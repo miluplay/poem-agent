@@ -260,7 +260,7 @@ class SearchPoemsContractTests(unittest.TestCase):
 class PromptAndAgentRegressionTests(unittest.TestCase):
     def test_prompt_requires_one_pool_initialization_and_target_pairing(self):
         self.assertIn("先且只能成功调用一次", SYSTEM_INSTRUCTION)
-        self.assertIn("全部 1–4 个 targets", SYSTEM_INSTRUCTION)
+        self.assertIn("全部 1–6 个 targets", SYSTEM_INSTRUCTION)
         self.assertIn("不能直接调用 search_poems", SYSTEM_INSTRUCTION)
         self.assertIn("必须拆成两个正确配对的 targets", SYSTEM_INSTRUCTION)
         self.assertIn("theme_coverage 在阶段 1 固定为 null", SYSTEM_INSTRUCTION)
@@ -300,12 +300,19 @@ class PromptAndAgentRegressionTests(unittest.TestCase):
                     {
                         "targets": [
                             {
+                                "target_ref": "t1",
                                 "author": "李白",
                                 "title": "春望",
                                 "dynasty": None,
                                 "themes": [],
                             }
-                        ]
+                        ],
+                        "tasks": [{
+                            "type": "appreciate",
+                            "target_refs": ["t1"],
+                            "aspects": [],
+                            "custom_aspects": [],
+                        }],
                     },
                 ),
                 decision(

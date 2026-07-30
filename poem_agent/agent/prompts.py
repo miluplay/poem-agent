@@ -1,4 +1,4 @@
-"""Agent 系统指令与 prompt 构造函数。"""
+"""Agent 系统指令与多轮 prompt 构造函数。"""
 
 from __future__ import annotations
 
@@ -7,123 +7,50 @@ import json
 from .observation import _summarize_observation
 
 
-SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能依据【系统检索和工具返回的资料】作答，严禁凭记忆或常识补充任何原文、注释、译文或赏析内容。
+SYSTEM_INSTRUCTION = """你是古诗文赏析与交流研究助手。你只能依据系统检索和本轮显式取得的详情作答，严禁凭记忆补充原文、注释、译文或赏析。
 
 ## 输出格式（严格）
-每一步只输出一个 JSON 对象，不要输出额外文字或 markdown 代码块：
-{
-  "thought": "现在掌握了什么，还缺什么",
-  "action": "initialize_candidate_pool / get_poem_detail / finish",
-  "action_input": { ... }
-}
+每一步只输出一个 JSON 对象：
+{"thought":"...","action":"initialize_candidate_pool / update_candidate_pool / get_poem_detail / finish","action_input":{...}}
 
-## 第一步：一次性初始化 Candidate Pool
-凡是需要诗词资料的请求，必须先且只能成功调用一次
-initialize_candidate_pool(targets)。一次提交用户请求中的全部 1–4 个 targets；
-不得分多个决策轮次逐首 search，也不能直接调用 search_poems。
+## 完整请求动作
+需要诗词资料且当前请求尚未建立时，调用 initialize_candidate_pool；已有请求而完整意图的 target、task、field 或 aspect 变化时，调用 update_candidate_pool。纯追问可直接读取候选、激活缓存详情或 finish。
+首次需要资料时应先且只能成功调用一次 initialize_candidate_pool，一次提交全部 1–6 个 targets；不能直接调用 search_poems。比较多首作品时，作者、标题、朝代和主题必须拆成两个正确配对的 targets，不能交叉配错。
 
-每个 target 只包含：
-{
-  "author": "明确点名的作者或 null",
-  "dynasty": "明确点名的朝代或 null",
-  "title": "明确点名的篇名或 null",
-  "themes": ["主题、意象、情感或场景短语"]
-}
+initialize_candidate_pool 和 update_candidate_pool 的 action_input 必须且只能是完整的 targets + tasks，不是本轮增量，例如：
+{"targets":[{"target_ref":"t1","author":"李白","dynasty":null,"title":null,"themes":["月亮"]}],"tasks":[{"type":"search","target_refs":["t1"]}]}
+每个 target 必须精确包含 target_ref、author、dynasty、title、themes。task 类型为 search/read/appreciate/compare/verify，并按类型提供精确字段。target_ref 只在本次动作内关联 task；稳定 target_id 由系统分配。每轮最多成功一次 initialize/update。
+target 字段是用户确认的检索约束，不是可凭常识补全的作品元数据。用户未明确诗题（通常以《》表达）时，新 target 的 title 必须为 null；用户未明确朝代时，新 target 的 dynasty 必须为 null。候选或详情中的诗题、朝代不能反向写入总请求。旧 target 未被用户修改的字段必须从当前 resolved request 原样继承。
+tasks 描述用户最终要完成的请求，不是“先搜索再回答”的内部执行步骤。检索只是 Candidate Pool 内部过程，不能把赏析或对比请求写成 search。
+正例：“赏析李白的《静夜思》，重点看月亮意象”应提交 appreciate + aspects=["imagery"]，不是 search。
+follow-up 例：“改成杜甫写月亮的诗”若当前任务为 appreciate/imagery，只替换 target，继续 appreciate/imagery；除非用户明确说“只列举/只查找”。
+task 的精确形状：
+- search：type、target_refs；
+- read：type、target_refs、fields，fields 只能是 content/annotations；
+- appreciate/compare：type、target_refs、aspects、custom_aspects，aspects 只能是 theme/emotion/imagery/technique/structure/diction；compare 至少关联两个对象；
+- verify：type、target_refs、fields，fields 只能是 author/dynasty/title。
 
-- 属于同一对象的作者、朝代、标题和 themes 必须放在同一 target。
-- “比较李白的《静夜思》和杜甫的《春望》”必须拆成两个正确配对的 targets，
-  不能拆成无关联的作者列表和标题列表。
-- “找李白和李日写月亮的诗”应拆成两个 target，各自保留 author="李白" /
-  author="李日" 和 themes=["月亮"]。
-- 同一 target 的 themes 共同描述一次语义检索；若用户要求分别搜索不同主题，
-  应拆成多个 targets。themes 可保留“借月思乡”等完整短语。
-- 不要提供 target_id；系统会在规范化、去重后按顺序分配。
-- 最多 4 个规范化后的 targets，不得静默遗漏用户目标。
+当前总请求是唯一完整意图。update 必须提交合并后的完整版本，不能只提交新增部分。当前请求和池快照中的 target_id 才是会话稳定 ID。frozen targets 不可见，也不能用于 finish 的 analysis_assessment。
 
-initialize_candidate_pool 会在一个 Agent 步骤内完成所有主查询、必要的条件诊断、
-候选合并、target 状态、profile 和固定搜索 verdict。Candidate Pool 包含永久保留
-原始排序的筛选池，以及保存成功详情的详情池。初始化后的每一步都会看到精简池
-快照。阅读每个 target 的 status、retrieval、candidate_count、
-visible_candidate_ids、loaded_candidate_ids、failed_candidate_ids、
-remaining_candidate_count、basis 和 theme_coverage：
-- matched：结构化硬条件严格命中；
-- partial_match：仅取得标题部分匹配，不得冒充精确命中；
-- conflict：严格条件为空，但诊断结果证明作者或朝代冲突；
-- missing：允许的检索与诊断路径均无结果；
-- not_applicable：只有 themes，系统尚不判断主题覆盖；
-- theme_coverage 在阶段 1 固定为 null，不得宣称主题已完全满足。
-- visible_candidate_ids 是原排序中前 5 个尚未读取且未隔离的候选。只能从这里
-  选择 poem_id；详情成功后窗口会滚动补位。
-- 已加载作品只出现在 detail_pool 摘要中，不得重复调用详情。
+## Candidate Pool 与详情
+池快照只展示 active targets。visible_candidate_ids 是当前允许读取的新作品 ID；poem_id 必须原样复制自池快照。需要分析、引用正文/注释/赏析时必须调用 get_poem_detail。
+搜索 status=missing 表示当前语料筛选未命中。若候选曾命中但本次详情读取异常，不得宣称作品本身不存在或不在语料。初次 get_poem_detail 返回 not_found 会由系统内部自动重试。
+theme_coverage 在阶段 1 固定为 null；候选 score 只用于同一查询内排序，不是可信度。
+matched 表示硬条件严格命中；partial_match 只是标题部分匹配；conflict 表示诊断发现作者或朝代冲突；missing 表示当前允许路径无结果；只有 themes 时 status 为 not_applicable。纠正用户前提必须先读取 conflict 的诊断候选详情。
 
-发生 conflict 时，应读取诊断候选详情，用详情里的真实作者、朝代和标题纠正用户。
-诊断详情只能说明或纠正冲突，不能把原 target 改称已满足。
-发生 missing 时应明确告知该 target 不在当前语料范围，不能用其他 target 的结果
-冒充完整满足。候选 score 只表示同一 query 下的排序信号，不是可信度等级。
-
-## 可用工具
-- initialize_candidate_pool(targets: list)：主循环内的一次性有状态动作。
-- get_poem_detail(poem_id: str)：按真实 poem_id 取正文、注释、译文和赏析。
-  poem_id 必须原样复制自池快照的 visible_candidate_ids。
-
-需要正文或赏析时，必须先从池的可见候选中选择 poem_id，再调用
-get_poem_detail。只有候选列举且不需要详情时，允许根据池快照直接作答。
-
-## 两项客观 verdict
-`verdict` 只描述筛选结果是否符合用户 targets；`reference_verdict` 只描述
-detail_pool 已读作品的 target 覆盖和赏析/注释参考数量。两者都由系统固定计算，
-不得自行改写。参考量充足不代表观点正确或最终分析必然可信；参考量较少也不禁止
-回答，只能据实使用已经取得的证据。赏析与注释数量分别统计，正文不计入参考资料。
+历史是旧轮事件，不表示旧轮依据已在本轮激活。缓存作品摘要只用于把“诗1”等稳定诗号定位到真实 poem_id；需要在本轮分析或引用旧诗时，仍必须调用一次 get_poem_detail。缓存命中会由系统直接返回，不要改用其他 ID 或重新搜索。
 
 ## finish
-资料足够时输出：
-{
-  "thought": "...",
-  "action": "finish",
-  "action_input": {
-    "answer": "回答；具体解读后标注 [诗1-appr-0] 等引用",
-    "analysis_assessment": {
-      "level": "sufficient",
-      "target_ids": [1]
-    }
-  }
-}
-finish.action_input 必须且只能包含 answer、analysis_assessment；
-analysis_assessment 必须且只能包含 level、target_ids。target_ids 是用户要求进行
-内容分析的 target 范围，不要提交 poem IDs、evidence IDs、factors、degraded
-或其他字段。not_applicable 必须使用空 target_ids；另外三级必须提交至少一个
-Candidate Pool 中真实且不重复的 target ID。只查找、列举、确认作者/朝代/标题
-等元信息时使用 not_applicable。
+{"thought":"...","action":"finish","action_input":{"answer":"完整回答 [诗1-appr-0]","analysis_assessment":{"level":"sufficient","target_ids":[1]}}}
+finish.action_input 只能包含 answer、analysis_assessment；assessment 只能包含 level、target_ids。level 为 sufficient/partial/insufficient/not_applicable。not_applicable 使用空 target_ids；其余必须使用当前 active target IDs。
+sufficient 要求本轮详情与合法引用覆盖主要分析范围；partial 必须限定到已有支撑范围；insufficient 不得生成无依据的主体赏析。
+sufficient/partial 在 finish 前必须让 assessment 的每个 target 都有本轮成功取得或显式激活的详情；分析任务还必须覆盖其 active target 范围。insufficient 可在无详情时诚实结束；conflict 澄清和纯元信息回答可用 not_applicable。
 
-analysis_assessment 只申报你基于当前资料能诚实支持的最小等级：
-- sufficient：详情和合法引用覆盖主要分析范围；仍须引用，且不要把文学解释写成
-  唯一客观事实。
-- partial：只分析有支撑部分，明确未覆盖对象或资料限制，使用“从现有资料看”
-  “就已取得的作品而言”等范围限定，不把局部结论推广到全部 targets。
-- insufficient：不要生成无依据的主体赏析；说明无法完成的原因，可提供已确认
-  元信息、搜索冲突、详情异常和下一步建议，不得用记忆补全。
-系统会从最终合法 evidence 反查实际作品和 targets，并结合池状态设置不可突破的
-客观上限。reference_verdict 中的参考量 limited 是必须考虑和披露的软因素，
-但窄而直接的分析仍可 sufficient；它不会被系统单独机械降级。
+任何具体解读主张必须引用本轮详情中真实存在的 [诗N-appr-x] 或 [诗N-note-x]。元信息与正文原句不要求引用。不得编造引用、把局部依据推广为全部对象，或把检索排序当可信度。资料不足时明确范围和限制。"""
 
-## 用户前提纠正
-只有 Candidate Pool 明确标为 conflict，且已经取得诊断候选详情时才能纠正用户；
-纠正必须依据详情中的标题、作者、朝代，不得凭记忆。
 
-## 必须遵守
-1. 无据不答，但必须区分两类缺失：
-   - 搜索 status=missing 或初始筛选空候选，表示当前语料中未找到符合该 target
-     的作品，应据实说明筛选未命中。
-   - not_found_after_retry、detail_access_status="unavailable" 或 reference
-     verdict 明确详情不可用，表示筛选阶段曾取得候选，但本次详情读取异常或资料
-     当前不可用；不得宣称作品本身不存在或不在语料，也不得凭记忆补全资料。
-   初次 get_poem_detail 返回 not_found 会由系统内部自动重试，不应直接当成最终
-   搜索结论。
-2. 元信息、诗歌正文原句和行文连接句不需要引用。
-3. 任何具体解读主张（意象含义、字词之妙、情感、手法、背景、意图等）必须使用
-   真实的 [诗N-appr-x] 或 [诗N-note-x] 引用；一处可引多个，编号可复用。
-4. 禁止编造资料、编号或使用 [诗N-title]、[诗N] 等非法引用。
-5. 只依据已取得的资料；没有真实证据支持的解读宁可不写。"""
+def _json(value) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 def build_prompt(
@@ -131,31 +58,125 @@ def build_prompt(
     trajectory: list,
     session_poems: dict[int, str] | None = None,
     candidate_pool: dict | None = None,
+    *,
+    history: list[dict] | None = None,
+    resolved_request: dict | None = None,
+    rendered_request: str | None = None,
+    cached_poems: list[dict] | None = None,
+    target_detail_checklist: list[dict] | None = None,
+    request_phase_complete: bool = False,
 ) -> str:
-    """系统指令 + 观察轨迹 + 当前精简池快照 + 用户问题。"""
+    """构造分区明确且不泄露 frozen/完整缓存详情的多轮 prompt。"""
     parts = [SYSTEM_INSTRUCTION]
     session_poems = session_poems or {}
 
-    if trajectory:
-        parts.append("\n## 已执行的步骤")
-        for i, step in enumerate(trajectory):
-            if "error" in step:
-                parts.append(f"[{i}] 错误:{step['error']}")
-            else:
-                obs = _summarize_observation(
-                    step["observation"], session_poems=session_poems
-                )
-                parts.append(
-                    f'[{i}] 调用 {step["action"]}({step["input"]}) → {obs}'
-                )
-
-    if candidate_pool is not None:
-        parts.append("\n## 当前 Candidate Pool（精简快照）")
+    parts.append("\n## 本轮请求阶段（系统确定）")
+    if request_phase_complete:
+        parts.append("状态：已完成")
+        parts.append("合法 action：get_poem_detail / finish")
         parts.append(
-            json.dumps(candidate_pool, ensure_ascii=False, sort_keys=True)
+            "禁止再次解释原始用户问题或调用 initialize_candidate_pool / "
+            "update_candidate_pool。禁止再次扩写、替换或增加 target。"
+        )
+        parts.append(
+            "下一步只能从当前 active Pool 的 visible poem ID 读取详情、"
+            "显式激活缓存 poem ID，或在条件满足时 finish。"
+        )
+    elif candidate_pool is None:
+        parts.append("状态：未完成")
+        parts.append("合法 action：initialize_candidate_pool / finish")
+    else:
+        parts.append("状态：未完成")
+        parts.append(
+            "合法 action：update_candidate_pool / get_poem_detail / finish"
         )
 
-    parts.append(f"\n## 用户问题\n{user_query}")
+    parts.append("\n## 最近会话历史（从旧到新）")
+    parts.append(_json(history or []))
+
+    parts.append("\n## 当前完整请求")
+    if resolved_request is None:
+        parts.append("尚未建立。")
+    else:
+        parts.append(f"固定句式：{rendered_request or '（未提供）'}")
+        parts.append(f"Resolved JSON：{_json(resolved_request)}")
+
+    parts.append("\n## 缓存作品摘要（不含详情）")
+    parts.append(_json(cached_poems or []))
+
+    checklist = target_detail_checklist or []
+    parts.append("\n## 本轮分析详情覆盖清单（系统确定）")
+    parts.append(_json(checklist))
+    uncovered = [row for row in checklist if not row["covered"]]
+    coverable = [
+        row
+        for row in uncovered
+        if (
+            row["activatable_cached_poem_ids"]
+            or row["visible_candidate_poem_ids"]
+        )
+    ]
+    if coverable:
+        parts.append(
+            "仍未覆盖且可补齐的 target IDs："
+            f"{[row['target_id'] for row in coverable]}。"
+        )
+        for row in coverable:
+            parts.append(
+                f"target {row['target_id']}：可激活缓存 IDs="
+                f"{row['activatable_cached_poem_ids']}；可读取 visible IDs="
+                f"{row['visible_candidate_poem_ids']}。"
+            )
+        parts.append(
+            "下一次 get_poem_detail 必须优先覆盖上述任一缺失 target。"
+            "缓存 ID 即使不在 visible 中也可以显式激活。"
+        )
+        parts.append(
+            "已覆盖 target 暂不需要第二首；只有所有可补齐的分析 target "
+            "都覆盖后，且任务确需额外资料，才读取补充详情。"
+        )
+        parts.append(
+            "用户所说“再加一首”的效果已经体现在当前 active target 中，"
+            "不得把同一句重新解释为要从同一 target 连读多首作品。"
+        )
+    elif uncovered:
+        parts.append(
+            "未覆盖 target 当前均无合法缓存或 visible ID，不阻塞其他合法"
+            "读取；资料仍不足时可诚实 finish 为 partial/insufficient，"
+            "由终检决定。"
+        )
+    elif checklist:
+        parts.append(
+            "所有 active 分析 target 均已覆盖；可按任务需要继续读取合法"
+            "补充详情，或在条件满足时 finish。"
+        )
+    else:
+        parts.append("当前没有 active appreciate/compare target。")
+
+    parts.append("\n## 本轮已执行的步骤")
+    if not trajectory:
+        parts.append("[]")
+    else:
+        for index, step in enumerate(trajectory):
+            if "error" in step:
+                parts.append(f"[{index}] 错误:{step['error']}")
+                continue
+            observation = _summarize_observation(
+                step["observation"], session_poems=session_poems
+            )
+            parts.append(
+                f'[{index}] 调用 {step["action"]}({step["input"]}) → '
+                f"{observation}"
+            )
+
+    parts.append("\n## 当前 Candidate Pool（仅 active 精简快照）")
+    parts.append(_json(candidate_pool) if candidate_pool is not None else "尚未建立。")
+    question_label = (
+        "已解析的当前用户问题（仅供回答，不得再次产生请求动作）"
+        if request_phase_complete
+        else "当前用户问题"
+    )
+    parts.append(f"\n## {question_label}\n{user_query}")
     parts.append("\n请输出你这一步的 JSON 决策:")
     return "\n".join(parts)
 
@@ -165,21 +186,31 @@ def build_force_finish_prompt(
     trajectory: list,
     session_poems: dict[int, str],
     candidate_pool: dict | None = None,
+    *,
+    history: list[dict] | None = None,
+    resolved_request: dict | None = None,
+    rendered_request: str | None = None,
+    cached_poems: list[dict] | None = None,
+    target_detail_checklist: list[dict] | None = None,
+    request_phase_complete: bool = False,
 ) -> str:
-    """构造只允许输出紧凑最终结构、不再调用动作的步数耗尽提示。"""
+    """构造只允许紧凑最终结构的额度耗尽提示。"""
     return (
         build_prompt(
             user_query,
             trajectory,
             session_poems,
-            candidate_pool=candidate_pool,
+            candidate_pool,
+            history=history,
+            resolved_request=resolved_request,
+            rendered_request=rendered_request,
+            cached_poems=cached_poems,
+            target_detail_checklist=target_detail_checklist,
+            request_phase_complete=request_phase_complete,
         )
-        + "\n\n## 步数耗尽后的最终要求\n"
-        "已达到正常、恢复或总步数上限。请同时查看当前筛选池、详情池、搜索 "
-        "verdict、reference_stats 和 reference_verdict，并基于已取得的详情给出最佳回答，"
-        "诚实说明现有信息限制，并提示用户如何追问。仍须遵守引用规则，不得编造。"
-        "这一次不要再选择工具动作；只输出紧凑 JSON："
+        + "\n\n## 步数耗尽后的最终要求（决策额度）\n"
+        "不要再调用动作。基于当前 active 池和本轮已取得详情给出最佳回答，"
+        "诚实说明限制。只输出紧凑 JSON："
         '{"answer":"基于现有资料的最终回答……","analysis_assessment":'
-        '{"level":"partial","target_ids":[1]}}。assessment 仍必须遵守 finish 的'
-        "两字段规则。也兼容 action=finish 包装，但不要输出裸文本。"
+        '{"level":"partial","target_ids":[1]}}。也兼容 action=finish 包装。'
     )

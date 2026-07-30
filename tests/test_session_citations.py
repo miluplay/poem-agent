@@ -35,6 +35,26 @@ def detail_step(observation: dict) -> dict:
     }
 
 
+def request_input(targets: list[dict], *, task_type="search") -> dict:
+    normalized = [
+        {
+            "target_ref": f"t{index}",
+            "author": target.get("author"),
+            "dynasty": target.get("dynasty"),
+            "title": target.get("title"),
+            "themes": target.get("themes", []),
+        }
+        for index, target in enumerate(targets, start=1)
+    ]
+    task = {
+        "type": task_type,
+        "target_refs": [item["target_ref"] for item in normalized],
+    }
+    if task_type in {"appreciate", "compare"}:
+        task.update({"aspects": [], "custom_aspects": []})
+    return {"targets": normalized, "tasks": [task]}
+
+
 class FakeLLM:
     def __init__(self, decisions: list[dict]):
         self.decisions = iter(decisions)
@@ -53,9 +73,9 @@ class SessionCitationTests(unittest.TestCase):
                 {
                     "thought": "初始化",
                     "action": "initialize_candidate_pool",
-                    "action_input": {
-                        "targets": [{"title": "静夜思", "themes": []}]
-                    },
+                    "action_input": request_input(
+                        [{"title": "静夜思"}], task_type="appreciate"
+                    ),
                 },
                 {
                     "thought": "取详情",
@@ -127,9 +147,9 @@ class SessionCitationTests(unittest.TestCase):
                 {
                     "thought": "先初始化候选池",
                     "action": "initialize_candidate_pool",
-                    "action_input": {
-                        "targets": [{"title": "静夜思", "themes": []}]
-                    },
+                    "action_input": request_input(
+                        [{"title": "静夜思"}], task_type="appreciate"
+                    ),
                 },
                 {
                     "thought": "取详情",
@@ -204,12 +224,10 @@ class SessionCitationTests(unittest.TestCase):
                 {
                     "thought": "一次初始化两个目标",
                     "action": "initialize_candidate_pool",
-                    "action_input": {
-                        "targets": [
-                            {"title": "甲诗", "themes": []},
-                            {"title": "乙诗", "themes": []},
-                        ]
-                    },
+                    "action_input": request_input(
+                        [{"title": "甲诗"}, {"title": "乙诗"}],
+                        task_type="compare",
+                    ),
                 },
                 {
                     "thought": "取第一次结果的详情",
@@ -222,7 +240,7 @@ class SessionCitationTests(unittest.TestCase):
                     "action_input": {
                         "answer": "这是甲诗解读 [诗1-appr-0]",
                         "analysis_assessment": {
-                            "level": "sufficient",
+                            "level": "insufficient",
                             "target_ids": [1],
                         },
                     },
@@ -281,6 +299,82 @@ class SessionCitationTests(unittest.TestCase):
         self.assertEqual(evidence[1]["reason"], "段编号不存在")
         self.assertTrue(evidence[0]["dangling"])
         self.assertTrue(evidence[1]["dangling"])
+
+    def test_cached_details_bind_without_current_detail_step(self):
+        poem = detail("poem-a", "甲诗", "缓存证据")
+        evidence = collect_evidence(
+            "赏析 [诗1-appr-0]，注释 [诗1-note-0]",
+            [],
+            {1: "poem-a"},
+            cached_details={"poem-a": poem},
+        )
+        self.assertEqual(
+            [(item["evidence_id"], item["text"]) for item in evidence],
+            [
+                ("poem-a#appr-0", "缓存证据"),
+                ("poem-a#anno-0", "缓存证据注"),
+            ],
+        )
+        self.assertTrue(all("dangling" not in item for item in evidence))
+
+    def test_unnumbered_cache_and_missing_cached_segment_stay_dangling(self):
+        poem = detail("poem-a", "甲诗", "缓存证据")
+        evidence = collect_evidence(
+            "未编号 [诗2-appr-0]；错段 [诗1-appr-9]",
+            [],
+            {1: "poem-a"},
+            cached_details={"poem-a": poem},
+        )
+        self.assertEqual(
+            [item["reason"] for item in evidence],
+            ["引用了未取详情的诗", "段编号不存在"],
+        )
+
+    def test_trajectory_overrides_cache_and_citations_are_not_duplicated(self):
+        cached = detail("poem-a", "甲诗", "旧缓存")
+        current = detail("poem-a", "甲诗", "本轮证据")
+        evidence = collect_evidence(
+            "先 [诗1-appr-0] 再重复 [诗1-appr-0]，后 [诗1-note-0]",
+            [detail_step(current)],
+            {1: "poem-a"},
+            cached_details={"poem-a": cached},
+        )
+        self.assertEqual(len(evidence), 2)
+        self.assertEqual(evidence[0]["text"], "本轮证据")
+        self.assertEqual(evidence[1]["text"], "本轮证据注")
+
+    def test_invalid_cached_entries_are_ignored_deterministically(self):
+        valid = detail("poem-a", "甲诗", "有效缓存")
+        invalid_cases = (
+            {"wrong-key": valid},
+            {"poem-a": {**valid, "error": "not_found"}},
+            {"poem-a": {**valid, "appreciation": "bad"}},
+            {
+                "poem-a": {
+                    **valid,
+                    "appreciation": [
+                        {"evidence_id": "other#appr-0", "text": "坏"}
+                    ],
+                }
+            },
+        )
+        for cached_details in invalid_cases:
+            with self.subTest(cached_details=cached_details):
+                evidence = collect_evidence(
+                    "引用 [诗1-appr-0]",
+                    [],
+                    {1: "poem-a"},
+                    cached_details=cached_details,
+                )
+                self.assertTrue(evidence[0]["dangling"])
+                self.assertEqual(evidence[0]["reason"], "段编号不存在")
+        with self.assertRaises(TypeError):
+            collect_evidence(
+                "引用 [诗1-appr-0]",
+                [],
+                {1: "poem-a"},
+                cached_details=[],
+            )
 
     def test_session_number_is_reused_for_same_poem(self):
         session_poems: dict[int, str] = {}

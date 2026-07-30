@@ -77,6 +77,22 @@ def finish(answer, level="not_applicable", target_ids=None):
     }
 
 
+def request_input(*, author=None, title=None, task_type="appreciate"):
+    task = {"type": task_type, "target_refs": ["t1"]}
+    if task_type in {"appreciate", "compare"}:
+        task.update({"aspects": [], "custom_aspects": []})
+    return {
+        "targets": [{
+            "target_ref": "t1",
+            "author": author,
+            "dynasty": None,
+            "title": title,
+            "themes": [],
+        }],
+        "tasks": [task],
+    }
+
+
 class FakeLLM:
     def __init__(self, responses):
         self.responses = iter(responses)
@@ -356,9 +372,7 @@ class UnifiedFinalCheckTests(unittest.TestCase):
             [
                 {
                     "action": "initialize_candidate_pool",
-                    "action_input": {
-                        "targets": [{"title": "甲", "themes": []}]
-                    },
+                    "action_input": request_input(title="甲"),
                 },
                 {
                     "action": "get_poem_detail",
@@ -401,9 +415,7 @@ class UnifiedFinalCheckTests(unittest.TestCase):
             [
                 {
                     "action": "initialize_candidate_pool",
-                    "action_input": {
-                        "targets": [{"title": "甲", "themes": []}]
-                    },
+                    "action_input": request_input(title="甲"),
                 },
                 {
                     "action": "get_poem_detail",
@@ -439,7 +451,7 @@ class UnifiedFinalCheckTests(unittest.TestCase):
         self.assertIn("分析支撑说明：", result["answer"])
         self.assertFalse(result["degraded"])
 
-    def test_second_invalid_assessment_keeps_answer_without_degrading(self):
+    def test_system_notice_does_not_require_model_regeneration(self):
         poem = detail("p1")
         invalid_second = finish(
             "第二次回答正文和引用有效 [诗1-appr-0]",
@@ -451,7 +463,7 @@ class UnifiedFinalCheckTests(unittest.TestCase):
             [
                 {
                     "action": "initialize_candidate_pool",
-                    "action_input": {"targets": [{"author": "甲"}]},
+                    "action_input": request_input(author="甲"),
                 },
                 {
                     "action": "get_poem_detail",
@@ -478,9 +490,10 @@ class UnifiedFinalCheckTests(unittest.TestCase):
         ):
             result = run_agent("分析甲诗", llm)
 
-        self.assertEqual(len(llm.prompts), 4)
-        self.assertIn("第二次回答正文和引用有效", result["answer"])
+        self.assertEqual(len(llm.prompts), 3)
+        self.assertIn("第一次采用保守等级", result["answer"])
         self.assertEqual(result["analysis_support"]["level"], "partial")
+        self.assertEqual(result["answer"].count("分析支撑说明："), 1)
         self.assertFalse(result["degraded"])
 
     def test_force_finish_accepts_wrapper_and_has_stable_public_shape(self):
@@ -516,7 +529,7 @@ class UnifiedFinalCheckTests(unittest.TestCase):
             [
                 {
                     "action": "initialize_candidate_pool",
-                    "action_input": {"targets": [{"author": "甲"}]},
+                    "action_input": request_input(author="甲"),
                 },
                 {
                     "action": "get_poem_detail",

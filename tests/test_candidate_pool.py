@@ -27,11 +27,32 @@ def candidate(
     }
 
 
-def init_decision(targets) -> dict:
+def init_decision(targets, *, task_type="search") -> dict:
+    normalized = [
+        {
+            "target_ref": f"t{index}",
+            "author": target.get("author"),
+            "dynasty": target.get("dynasty"),
+            "title": target.get("title"),
+            "themes": target.get("themes", []),
+        }
+        for index, target in enumerate(targets, start=1)
+    ]
     return {
         "thought": "一次提交全部目标",
         "action": "initialize_candidate_pool",
-        "action_input": {"targets": targets},
+        "action_input": {
+            "targets": normalized,
+            "tasks": [{
+                "type": task_type,
+                "target_refs": [item["target_ref"] for item in normalized],
+                **(
+                    {"aspects": [], "custom_aspects": []}
+                    if task_type in {"appreciate", "compare"}
+                    else {}
+                ),
+            }],
+        },
     }
 
 
@@ -369,7 +390,8 @@ class CandidatePoolAgentTests(unittest.TestCase):
             result = run_agent("找李白的诗", llm)
 
         search.assert_called_once()
-        self.assertIn("只允许成功初始化一次", llm.prompts[2])
+        self.assertIn("本轮请求动作已经成功", llm.prompts[2])
+        self.assertIn("禁止再次扩写、替换或增加 target", llm.prompts[2])
         self.assertEqual(
             result["candidate_pool"]["targets"][0]["author"], "李白"
         )
@@ -401,7 +423,8 @@ class CandidatePoolAgentTests(unittest.TestCase):
                     [
                         {"author": "李白", "title": "静夜思"},
                         {"author": "杜甫", "title": "春望"},
-                    ]
+                    ],
+                    task_type="compare",
                 ),
                 {
                     "thought": "取第一首详情",
@@ -424,7 +447,7 @@ class CandidatePoolAgentTests(unittest.TestCase):
                 clear=True,
             ),
         ):
-            result = run_agent("比较两首诗", llm)
+            result = run_agent("比较《静夜思》和《春望》", llm)
 
         self.assertIn('"target_id": 1', llm.prompts[1])
         self.assertIn('"target_id": 2', llm.prompts[1])

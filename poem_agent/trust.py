@@ -1,6 +1,6 @@
 """可信度层。★ 你亲手写。纵线阶段:先只做引用绑定。"""
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 # 对外只允许赏析和注释两类引用；宽匹配用于剥离模型自造的类似引用。
 _LEGAL_CITE = re.compile(r"\[诗\d+-(?:appr|note)-\d+\]")
@@ -183,6 +183,8 @@ def collect_evidence(
     answer: str,
     trajectory: list,
     session_poems: dict[int, str] | None = None,
+    *,
+    cached_details: Mapping[str, dict] | None = None,
 ) -> list:
     """★ 引用绑定核心:
     1. 从 answer 抽出所有 [诗N-appr-x]/[诗N-note-x] 引用;
@@ -193,7 +195,9 @@ def collect_evidence(
     citations = _extract_session_citations(answer)
 
     # 完整 evidence_id 全局唯一，因此索引不会再被跨诗短 id 覆盖。
-    index = _build_evidence_index(trajectory)
+    index = _build_evidence_index(
+        trajectory, cached_details=cached_details
+    )
 
     evidence: list[dict] = []
     for poem_number, short_evidence_id in citations:
@@ -257,30 +261,81 @@ def _dangling_evidence(
     }
 
 
-def _build_evidence_index(trajectory: list) -> dict:
+def _build_evidence_index(
+    trajectory: list,
+    *,
+    cached_details: Mapping[str, dict] | None = None,
+) -> dict:
     """遍历轨迹里所有 get_poem_detail 观察，建完整 evidence_id → 块索引。
-    块里带上 poem_id/title,方便前端显示'出自哪首诗'。"""
+    缓存先进入索引，本轮合法观察随后覆盖同一作品的缓存内容。"""
     index: dict[str, dict] = {}
+    if cached_details is not None:
+        if not isinstance(cached_details, Mapping):
+            raise TypeError("cached_details 必须是 poem_id → detail 的映射")
+        for poem_id, detail in cached_details.items():
+            if not isinstance(poem_id, str):
+                continue
+            _add_detail_to_evidence_index(
+                index, detail, expected_poem_id=poem_id
+            )
+
     for step in trajectory:
+        if not isinstance(step, dict):
+            continue
         if step.get("action") != "get_poem_detail":
             continue
         obs = step.get("observation")
-        if not isinstance(obs, dict) or "error" in obs:
-            continue
-        poem_id = obs.get("poem_id")
-        title = obs.get("title")
-        for key in ("appreciation", "annotations"):
-            for item in obs.get(key, []):
-                full_id = item.get("evidence_id")
-                if not full_id: continue
-                block = {
-                    "evidence_id": full_id,
-                    "text": item["text"],
-                    "poem_id": poem_id,
-                    "title": title,
-                }
-                index[full_id] = block
-                # 语料中的注释 ID 沿用 anno-*，对外合法 marker 使用 note-*。
-                if "#anno-" in full_id:
-                    index[full_id.replace("#anno-", "#note-", 1)] = block
+        _add_detail_to_evidence_index(index, obs)
     return index
+
+
+def _add_detail_to_evidence_index(
+    index: dict[str, dict],
+    detail,
+    *,
+    expected_poem_id: str | None = None,
+) -> None:
+    """安全忽略不符合详情/evidence 基本结构的缓存或轨迹条目。"""
+    if not isinstance(detail, dict) or "error" in detail:
+        return
+    poem_id = detail.get("poem_id")
+    title = detail.get("title")
+    if (
+        not isinstance(poem_id, str)
+        or not poem_id
+        or (expected_poem_id is not None and poem_id != expected_poem_id)
+        or not isinstance(title, str)
+    ):
+        return
+    collections = []
+    for key in ("appreciation", "annotations"):
+        items = detail.get(key)
+        if not isinstance(items, list):
+            return
+        validated = []
+        for item in items:
+            if not isinstance(item, dict):
+                return
+            full_id = item.get("evidence_id")
+            text = item.get("text")
+            if (
+                not isinstance(full_id, str)
+                or not full_id.startswith(f"{poem_id}#")
+                or not isinstance(text, str)
+            ):
+                return
+            validated.append((full_id, text))
+        collections.append(validated)
+
+    for items in collections:
+        for full_id, text in items:
+            block = {
+                "evidence_id": full_id,
+                "text": text,
+                "poem_id": poem_id,
+                "title": title,
+            }
+            index[full_id] = block
+            # 语料中的注释 ID 沿用 anno-*，对外合法 marker 使用 note-*。
+            if "#anno-" in full_id:
+                index[full_id.replace("#anno-", "#note-", 1)] = block
