@@ -137,23 +137,40 @@ Agent 只能对当前 `visible_candidate_ids` 调用 `get_poem_detail`，或显�
 ├── scripts/
 │   └── build_index.py           # 构建正文/赏析 Chroma 索引
 ├── poem_agent/
-│   ├── request.py                    # 完整 targets + tasks 请求协议与固定句式
-│   ├── session.py                    # 进程内请求、Pool、诗号、缓存与有限历史
-│   ├── candidate_pool.py             # active/frozen 筛选池、详情池与客观画像
-│   ├── analysis_support.py           # finish 协议、逐 target 支撑与客观上限
 │   ├── agent/
-│   │   ├── __init__.py          # Agent 主循环、请求阶段、详情覆盖与统一收尾
+│   │   ├── __init__.py          # 稳定 API 重导出
+│   │   ├── runner.py            # 主循环、预算与动作路由
+│   │   ├── decisions.py         # 模型 JSON 与动作输入协议
+│   │   ├── detail_policy.py     # 详情授权、覆盖与 finish 就绪策略
+│   │   ├── finalization.py      # finish、强制收尾与统一终检
 │   │   ├── prompts.py           # 多轮状态、覆盖清单和系统指令构造
 │   │   ├── observation.py       # 工具观察摘要与会话诗编号
 │   │   └── display.py           # verbose 模式展示
+│   ├── request/
+│   │   ├── models.py            # 完整请求领域模型
+│   │   ├── normalization.py     # 字段与 task 协议规范化
+│   │   ├── semantics.py         # 用户原话与 follow-up 守卫
+│   │   └── rendering.py         # 确定性中文渲染
+│   ├── candidate/
+│   │   ├── pool.py              # CandidatePool 唯一可变聚合根
+│   │   ├── models.py            # Target、QueryTask 与兼容规范化
+│   │   ├── queries.py           # 主/诊断查询与 target 状态
+│   │   └── profile.py           # 参考量画像与固定 verdict
+│   ├── evidence/
+│   │   ├── citations.py         # 引用绑定、marker 清理与 dangling 原因
+│   │   ├── integrity.py         # 完整性检查与 fallback
+│   │   └── support.py           # analysis assessment 与客观上限
+│   ├── contracts.py             # 最终输出、evidence 与支撑结论的稳定类型合同
+│   ├── session.py               # 进程内请求、Pool、诗号、缓存与有限历史
+│   ├── candidate_pool.py        # CandidatePool 兼容导出与检索注入点
+│   ├── analysis_support.py      # analysis support 兼容导出
+│   ├── trust.py                 # Evidence 兼容导出
 │   ├── tools/
 │   │   ├── search.py            # search_poems 工具契约
 │   │   └── detail.py            # get_poem_detail 工具契约
 │   ├── retrieval/
 │   │   └── engine.py            # 标题、语义、标签混合检索
-│   ├── store.py                 # poems.json 加载与基础查询
-│   ├── trust.py                 # 完整性与引用绑定底层函数、降级提示
-│   └── utils.py
+│   └── store.py                 # poems.json 加载与基础查询
 ├── .env.example
 └── requirements.txt
 ```

@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import json
 
-from ..utils import short_id
-
-
 EMPTY_SEARCH_OBSERVATION = (
     "检索到 0 首。可能是硬条件彼此冲突或作品不在语料库中。若这是首次组合"
     "硬条件空结果,可按系统指令进行一次参数不同的诊断性放宽检索；否则应"
@@ -99,7 +96,7 @@ def _summarize_observation(
     if appr:
         lines.append(f"赏析共 {len(appr)} 块:")
         for item in appr:
-            short = short_id(item["evidence_id"])
+            short = _short_evidence_id(item["evidence_id"])
             cite = (
                 f"诗{poem_number}-{short}"
                 if poem_number is not None
@@ -112,7 +109,7 @@ def _summarize_observation(
     if anno:
         lines.append(f"注释共 {len(anno)} 条:")
         for item in anno:
-            short = short_id(item["evidence_id"])
+            short = _short_evidence_id(item["evidence_id"])
             if short.startswith("anno-"):
                 short = "note-" + short.removeprefix("anno-")
             cite = (
@@ -133,3 +130,8 @@ def _session_poem_number(
         if known_poem_id == poem_id:
             return poem_number
     return None
+
+
+def _short_evidence_id(evidence_id: str) -> str:
+    """从完整 evidence ID 提取面向模型展示的诗内短 ID。"""
+    return evidence_id.split("#")[-1] if evidence_id else ""
